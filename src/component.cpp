@@ -23,6 +23,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -295,9 +296,13 @@ void Component::publish_diagnostics()
       status.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
       status.message = "tracking";
 
-      SurvivePose pose = {};
-      const FLT pose_time = survive_simple_object_get_latest_pose(it, &pose);
-      const double pose_age_s = survive_simple_run_time(actx_) - pose_time;
+      // Age since this tracker's pose was last broadcast, in ROS time (set in
+      // the work loop on each PoseUpdateEvent). Infinity until the first pose.
+      double pose_age_s = std::numeric_limits<double>::infinity();
+      const auto seen = last_pose_time_.find(serial);
+      if (seen != last_pose_time_.end()) {
+        pose_age_s = (this->now() - seen->second).seconds();
+      }
 
       double residual = std::nan("");
       {
@@ -349,6 +354,10 @@ void Component::work()
               pose_msg.child_frame_id = survive_simple_serial_number(pose_event->object);
               ros_from_pose(&pose_msg.transform, pose);
               tf_broadcaster_->sendTransform(pose_msg);
+              // Stamp pose freshness in ROS time at receive — robust to
+              // libsurvive's internal clock bases. Read by publish_diagnostics
+              // (same worker thread, so no lock needed).
+              last_pose_time_[pose_msg.child_frame_id] = this->now();
             }
           }
           break;

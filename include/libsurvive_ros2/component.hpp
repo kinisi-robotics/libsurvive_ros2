@@ -95,6 +95,10 @@ private:
   std::mutex quality_mutex_;
   std::map<std::string, double> light_residuals_;
 
+  // ROS time each tracker's pose was last broadcast, for pose-freshness in
+  // diagnostics. Written and read only on the worker thread, so no lock needed.
+  std::map<std::string, rclcpp::Time> last_pose_time_;
+
   bool publish_diagnostics_ = true;
   bool capture_light_residual_ = true;
   double diagnostics_rate_ = 10.0;
