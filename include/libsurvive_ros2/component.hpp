@@ -28,6 +28,8 @@
 
 // C++ system
 #include <cstdint>
+#include <cstring>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -35,6 +37,8 @@
 #include <vector>
 
 // Other
+#include "diagnostic_msgs/msg/diagnostic_array.hpp"
+#include "diagnostic_msgs/msg/diagnostic_status.hpp"
 #include "diagnostic_msgs/msg/key_value.hpp"
 #include "geometry_msgs/msg/point_stamped.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
@@ -56,19 +60,45 @@ public:
   virtual ~Component();
   rclcpp::Time get_ros_time(const std::string & str, FLT timecode);
   void publish_imu(const sensor_msgs::msg::Imu & msg);
+  // Record the latest smoothed optical residual for a tracker serial. Called
+  // from the libsurvive datalog callback (libsurvive worker thread).
+  void record_light_residual(const std::string & serial, double value);
 
 private:
   void work();
+  // Publish per-lighthouse calibration flags and per-tracker pose confidence /
+  // optical residual on a diagnostic_msgs/DiagnosticArray for downstream gating.
+  void publish_diagnostics();
+
   SurviveSimpleContext * actx_;
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
   std::shared_ptr<tf2_ros::StaticTransformBroadcaster> tf_static_broadcaster_;
   rclcpp::Publisher<sensor_msgs::msg::Joy>::SharedPtr joy_publisher_;
   rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_publisher_;
   rclcpp::Publisher<diagnostic_msgs::msg::KeyValue>::SharedPtr cfg_publisher_;
+  rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diagnostics_publisher_;
   std::thread worker_thread_;
   rclcpp::Time last_base_station_update_;
   std::string tracking_frame_;
   double lighthouse_rate_;
+
+  // libsurvive stamps on its own internal epoch (≈0 + seconds-since-init). This
+  // offset maps that epoch onto the ROS clock; it is captured exactly once, on
+  // the first sample, by get_ros_time(). std::call_once makes the one-time
+  // capture safe across the 250 Hz IMU callback and the worker thread.
+  std::once_flag epoch_once_;
+  rclcpp::Duration epoch_offset_{0, 0};
+
+  // Latest smoothed optical residual ("light_residuals_all") per tracker serial,
+  // written by the datalog callback and read by publish_diagnostics(). Guarded
+  // because the two run on different threads.
+  std::mutex quality_mutex_;
+  std::map<std::string, double> light_residuals_;
+
+  bool publish_diagnostics_ = true;
+  bool capture_light_residual_ = true;
+  double diagnostics_rate_ = 10.0;
+  double last_diag_update_s_ = 0.0;
 };
 
 }  // namespace libsurvive_ros2
