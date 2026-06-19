@@ -82,13 +82,6 @@ private:
   std::string tracking_frame_;
   double lighthouse_rate_;
 
-  // libsurvive stamps on its own internal epoch (≈0 + seconds-since-init). This
-  // offset maps that epoch onto the ROS clock; it is captured exactly once, on
-  // the first sample, by get_ros_time(). std::call_once makes the one-time
-  // capture safe across the 250 Hz IMU callback and the worker thread.
-  std::once_flag epoch_once_;
-  rclcpp::Duration epoch_offset_{0, 0};
-
   // Latest smoothed optical residual ("light_residuals_all") per tracker serial,
   // written by the datalog callback and read by publish_diagnostics(). Guarded
   // because the two run on different threads.

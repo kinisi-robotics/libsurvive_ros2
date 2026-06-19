@@ -195,23 +195,10 @@ Component::~Component()
 
 rclcpp::Time Component::get_ros_time(const std::string & /*str*/, FLT timecode)
 {
-  // libsurvive's timecode is seconds since driver init on its own internal epoch,
-  // disjoint from the ROS clock the camera and recorder run on. Capture the offset
-  // between the two clocks ONCE (on the first sample) and apply it to every stamp:
-  // this preserves libsurvive's precise inter-sample timing — which matters for the
-  // 250 Hz IMU — while anchoring the whole stream to the ROS clock. The device time
-  // is built with the node clock's type so the subtraction below cannot mismatch
-  // time sources, and std::call_once makes the one-time capture race-free across the
-  // IMU callback thread and the worker thread (both call this concurrently).
-  const rcl_clock_type_t clock_type = this->get_clock()->get_clock_type();
-  const rclcpp::Time device =
-    rclcpp::Time(0, 0, clock_type) +
-    rclcpp::Duration(std::chrono::duration<double>(timecode));
-  std::call_once(
-    epoch_once_, [this, &device]() {
-      epoch_offset_ = this->now() - device;
-    });
-  return device + epoch_offset_;
+  // libsurvive's timecode is already seconds since the UNIX epoch (sourced from
+  // gettimeofday() in driver_vive.hidapi.h and smoothed by libsurvive's
+  // runtime-offset filter), so it maps directly onto the ROS wall clock.
+  return rclcpp::Time() + rclcpp::Duration(std::chrono::duration<double>(timecode));
 }
 
 void Component::record_light_residual(const std::string & serial, double value)
