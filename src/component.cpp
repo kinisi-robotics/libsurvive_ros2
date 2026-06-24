@@ -105,7 +105,7 @@ Component::Component(const rclcpp::NodeOptions & options)
 
   // Setup driver parameters.
   std::string driver_args;
-  this->declare_parameter("driver_args", "--force-recalibrate 1");
+  this->declare_parameter("driver_args", "--force-calibrate 1");
   this->get_parameter("driver_args", driver_args);
   std::vector<const char *> args;
   std::stringstream driver_ss(driver_args);
