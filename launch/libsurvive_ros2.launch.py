@@ -40,7 +40,7 @@ CFG_FILE = os.path.join(
 
 # Sow we don't have to repeat for composable and non-composable versions.
 PARAMETERS = [
-    {'driver_args': f'--force-recalibrate 1 -c {CFG_FILE}'},
+    {'driver_args': f'--force-calibrate 1 -c {CFG_FILE}'},
     {'tracking_frame': 'libsurvive_world'},
     {'imu_topic': 'imu'},
     {'joy_topic': 'joy'},
