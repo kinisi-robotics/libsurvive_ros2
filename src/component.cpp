@@ -19,7 +19,13 @@
 // THE SOFTWARE.
 
 // C++ system
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <limits>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -53,6 +59,25 @@ static void imu_func(
     imu_msg.linear_acceleration.z = accelgyromag[2] * SI_GRAVITY;
     _singleton->publish_imu(imu_msg);
   }
+}
+
+// libsurvive emits many internal time series through the datalog hook; we keep
+// only the smoothed optical residual ("res_error_light_avg", i.e. the tracker's
+// light_residuals_all), which is the value libsurvive itself thresholds against
+// light-error-threshold to decide tracking is lost. The name check rejects every
+// other series cheaply. Runs on the libsurvive worker thread.
+static void datalog_func(
+  SurviveObject * so, const char * name, const FLT * values, size_t length)
+{
+  if (_singleton == nullptr || so == nullptr || name == nullptr ||
+    values == nullptr || length == 0)
+  {
+    return;
+  }
+  if (std::strcmp(name, "res_error_light_avg") != 0) {
+    return;
+  }
+  _singleton->record_light_residual(so->serial_number, values[0]);
 }
 
 static void ros_from_pose(
@@ -103,6 +128,21 @@ Component::Component(const rclcpp::NodeOptions & options)
   this->get_parameter("cfg_topic", cfg_topic);
   cfg_publisher_ = this->create_publisher<diagnostic_msgs::msg::KeyValue>(cfg_topic, 10);
 
+  // Diagnostics: per-lighthouse calibration flags + per-tracker pose confidence
+  // and optical residual, for downstream calibration gating. Published from the
+  // work loop at diagnostics_rate Hz.
+  std::string diagnostics_topic;
+  this->declare_parameter("publish_diagnostics", true);
+  this->get_parameter("publish_diagnostics", publish_diagnostics_);
+  this->declare_parameter("capture_light_residual", true);
+  this->get_parameter("capture_light_residual", capture_light_residual_);
+  this->declare_parameter("diagnostics_rate", 10.0);
+  this->get_parameter("diagnostics_rate", diagnostics_rate_);
+  this->declare_parameter("diagnostics_topic", "diagnostics");
+  this->get_parameter("diagnostics_topic", diagnostics_topic);
+  diagnostics_publisher_ =
+    this->create_publisher<diagnostic_msgs::msg::DiagnosticArray>(diagnostics_topic, 10);
+
   // Setup driver parameters.
   std::string driver_args;
   this->declare_parameter("driver_args", "--force-calibrate 1");
@@ -124,6 +164,13 @@ Component::Component(const rclcpp::NodeOptions & options)
   // Setup callback for reading IMU data.
   SurviveContext * ctx = survive_simple_get_ctx(actx_);
   survive_install_imu_fn(ctx, imu_func);
+
+  // Capture the smoothed optical residual via the datalog hook; it is exposed on
+  // no other interface. Installing the hook makes every SV_DATA_LOG site fire the
+  // callback, so the callback rejects non-matching series cheaply (see datalog_func).
+  if (capture_light_residual_) {
+    survive_install_datalog_fn(ctx, datalog_func);
+  }
 
   // Initialize the survive thread.
   survive_simple_start_thread(actx_);
@@ -148,7 +195,16 @@ Component::~Component()
 
 rclcpp::Time Component::get_ros_time(const std::string & /*str*/, FLT timecode)
 {
+  // libsurvive's timecode is already seconds since the UNIX epoch (sourced from
+  // gettimeofday() in driver_vive.hidapi.h and smoothed by libsurvive's
+  // runtime-offset filter), so it maps directly onto the ROS wall clock.
   return rclcpp::Time() + rclcpp::Duration(std::chrono::duration<double>(timecode));
+}
+
+void Component::record_light_residual(const std::string & serial, double value)
+{
+  std::lock_guard<std::mutex> lock(quality_mutex_);
+  light_residuals_[serial] = value;
 }
 
 void Component::publish_imu(const sensor_msgs::msg::Imu & msg)
@@ -156,6 +212,105 @@ void Component::publish_imu(const sensor_msgs::msg::Imu & msg)
   if (imu_publisher_) {
     imu_publisher_->publish(msg);
   }
+}
+
+namespace
+{
+void add_kv(
+  diagnostic_msgs::msg::DiagnosticStatus & status, const std::string & key,
+  const std::string & value)
+{
+  diagnostic_msgs::msg::KeyValue kv;
+  kv.key = key;
+  kv.value = value;
+  status.values.push_back(kv);
+}
+
+std::string num(double value)
+{
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), "%.6g", value);
+  return std::string(buf);
+}
+}  // namespace
+
+void Component::publish_diagnostics()
+{
+  diagnostic_msgs::msg::DiagnosticArray array;
+  array.header.stamp = this->now();
+  array.header.frame_id = tracking_frame_;
+
+  for (const SurviveSimpleObject * it = survive_simple_get_first_object(actx_); it != nullptr;
+    it = survive_simple_get_next_object(actx_, it))
+  {
+    const char * serial_c = survive_simple_serial_number(it);
+    const std::string serial = serial_c ? serial_c : "";
+
+    diagnostic_msgs::msg::DiagnosticStatus status;
+    status.hardware_id = serial;
+
+    if (survive_simple_object_get_type(it) == SurviveSimpleObject_LIGHTHOUSE) {
+      status.name = "libsurvive/lighthouse/" + serial;
+      BaseStationData * bsd = survive_simple_get_bsd(it);
+      if (bsd == nullptr) {
+        status.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+        status.message = "no base station data";
+      } else {
+        const bool calibrated = bsd->PositionSet && bsd->OOTXSet;
+        status.level = calibrated ?
+          diagnostic_msgs::msg::DiagnosticStatus::OK :
+          diagnostic_msgs::msg::DiagnosticStatus::WARN;
+        status.message = calibrated ? "calibrated" : "calibrating";
+        add_kv(status, "position_set", bsd->PositionSet ? "true" : "false");
+        add_kv(status, "ootx_set", bsd->OOTXSet ? "true" : "false");
+        add_kv(status, "ootx_checked", bsd->OOTXChecked ? "true" : "false");
+        add_kv(status, "disabled", bsd->disable ? "true" : "false");
+        add_kv(status, "base_station_id", std::to_string(bsd->BaseStationID));
+        add_kv(status, "mode", std::to_string(static_cast<int>(bsd->mode)));
+        add_kv(status, "confidence", num(bsd->confidence));
+        const FLT * var = &bsd->variance.Pos[0];
+        add_kv(
+          status, "variance",
+          num(var[0]) + " " + num(var[1]) + " " + num(var[2]) + " " +
+          num(var[3]) + " " + num(var[4]) + " " + num(var[5]));
+      }
+    } else {
+      SurviveObject * so = survive_simple_get_survive_object(it);
+      if (so == nullptr) {
+        continue;  // external / unknown object — nothing to report
+      }
+      status.name = "libsurvive/tracker/" + serial;
+      status.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
+      status.message = "tracking";
+
+      // Age since this tracker's pose was last broadcast, in ROS time (set in
+      // the work loop on each PoseUpdateEvent). Infinity until the first pose.
+      double pose_age_s = std::numeric_limits<double>::infinity();
+      const auto seen = last_pose_time_.find(serial);
+      if (seen != last_pose_time_.end()) {
+        pose_age_s = (this->now() - seen->second).seconds();
+      }
+
+      double residual = std::nan("");
+      {
+        std::lock_guard<std::mutex> lock(quality_mutex_);
+        const auto found = light_residuals_.find(so->serial_number);
+        if (found != light_residuals_.end()) {
+          residual = found->second;
+        }
+      }
+
+      add_kv(status, "pose_confidence", num(so->poseConfidence));
+      add_kv(status, "light_residual", num(residual));
+      add_kv(status, "pose_age_s", num(pose_age_s));
+      add_kv(status, "charging", so->charging ? "true" : "false");
+      add_kv(status, "charge_percent", std::to_string(static_cast<int>(so->charge)));
+    }
+
+    array.status.push_back(status);
+  }
+
+  diagnostics_publisher_->publish(array);
 }
 
 void Component::work()
@@ -186,6 +341,10 @@ void Component::work()
               pose_msg.child_frame_id = survive_simple_serial_number(pose_event->object);
               ros_from_pose(&pose_msg.transform, pose);
               tf_broadcaster_->sendTransform(pose_msg);
+              // Stamp pose freshness in ROS time at receive — robust to
+              // libsurvive's internal clock bases. Read by publish_diagnostics
+              // (same worker thread, so no lock needed).
+              last_pose_time_[pose_msg.child_frame_id] = this->now();
             }
           }
           break;
@@ -267,6 +426,18 @@ void Component::work()
             tf_static_broadcaster_->sendTransform(pose_msg);
           }
         }
+      }
+    }
+
+    // Publish diagnostics at a decimated rate. The loop is event-driven, so gate
+    // on wall-clock seconds (compared as doubles, matching the base-station gate
+    // above) rather than on rclcpp::Time subtraction, which would require matching
+    // clock sources.
+    if (publish_diagnostics_ && diagnostics_rate_ > 0.0) {
+      const double now_s = this->get_clock()->now().seconds();
+      if (now_s - last_diag_update_s_ >= 1.0 / diagnostics_rate_) {
+        last_diag_update_s_ = now_s;
+        publish_diagnostics();
       }
     }
   }
