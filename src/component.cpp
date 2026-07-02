@@ -195,9 +195,6 @@ Component::~Component()
 
 rclcpp::Time Component::get_ros_time(const std::string & /*str*/, FLT timecode)
 {
-  // libsurvive's timecode is already seconds since the UNIX epoch (sourced from
-  // gettimeofday() in driver_vive.hidapi.h and smoothed by libsurvive's
-  // runtime-offset filter), so it maps directly onto the ROS wall clock.
   return rclcpp::Time() + rclcpp::Duration(std::chrono::duration<double>(timecode));
 }
 
@@ -251,6 +248,11 @@ void Component::publish_diagnostics()
 
     if (survive_simple_object_get_type(it) == SurviveSimpleObject_LIGHTHOUSE) {
       status.name = "libsurvive/lighthouse/" + serial;
+      // bsd->* (and so->* below) are read directly from libsurvive's internal
+      // state while its worker thread may be writing them — non-atomic reads that
+      // can tear on the FLT arrays. Accepted for diagnostics: the values are only
+      // ever advisory here, never used for control, and a torn sample self-corrects
+      // on the next publish.
       BaseStationData * bsd = survive_simple_get_bsd(it);
       if (bsd == nullptr) {
         status.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
@@ -268,6 +270,9 @@ void Component::publish_diagnostics()
         add_kv(status, "base_station_id", std::to_string(bsd->BaseStationID));
         add_kv(status, "mode", std::to_string(static_cast<int>(bsd->mode)));
         add_kv(status, "confidence", num(bsd->confidence));
+        // variance is a SurviveAxisAnglePose: Pos[3] followed by AxisAngleRot[3],
+        // i.e. 6 contiguous FLTs (3 position + 3 axis-angle rotation variances),
+        // matching the 6-DOF layout in config.json. Not a quaternion pose.
         const FLT * var = &bsd->variance.Pos[0];
         add_kv(
           status, "variance",
@@ -291,10 +296,13 @@ void Component::publish_diagnostics()
         pose_age_s = (this->now() - seen->second).seconds();
       }
 
+      // record_light_residual() keys by so->serial_number (datalog thread), and
+      // survive_simple_serial_number() returns that same field for trackers, so
+      // `serial` is the identical key — use it for a single, consistent source.
       double residual = std::nan("");
       {
         std::lock_guard<std::mutex> lock(quality_mutex_);
-        const auto found = light_residuals_.find(so->serial_number);
+        const auto found = light_residuals_.find(serial);
         if (found != light_residuals_.end()) {
           residual = found->second;
         }
@@ -432,7 +440,11 @@ void Component::work()
     // Publish diagnostics at a decimated rate. The loop is event-driven, so gate
     // on wall-clock seconds (compared as doubles, matching the base-station gate
     // above) rather than on rclcpp::Time subtraction, which would require matching
-    // clock sources.
+    // clock sources. survive_simple_wait_for_event() wakes at least every 100 ms
+    // (its condvar timeout) even when no events arrive, so a stalled/lost tracker
+    // still gets diagnostics published at up to ~10 Hz — reporting the degradation
+    // (rising pose_age_s) rather than looking like a dead node. A diagnostics_rate
+    // above ~10 Hz is therefore capped by that wake interval during event starvation.
     if (publish_diagnostics_ && diagnostics_rate_ > 0.0) {
       const double now_s = this->get_clock()->now().seconds();
       if (now_s - last_diag_update_s_ >= 1.0 / diagnostics_rate_) {
