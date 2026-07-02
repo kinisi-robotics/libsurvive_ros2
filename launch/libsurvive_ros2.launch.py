@@ -45,7 +45,11 @@ PARAMETERS = [
     {'imu_topic': 'imu'},
     {'joy_topic': 'joy'},
     {'cfg_topic': 'cfg'},
-    {'lighthouse_rate': 4.0}]
+    {'lighthouse_rate': 4.0},
+    {'diagnostics_topic': 'diagnostics'},
+    {'publish_diagnostics': True},
+    {'capture_light_residual': True},
+    {'diagnostics_rate': 10.0}]
 
 
 def generate_launch_description():
