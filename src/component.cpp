@@ -147,11 +147,23 @@ Component::Component(const rclcpp::NodeOptions & options)
   std::string driver_args;
   this->declare_parameter("driver_args", "--force-calibrate 1");
   this->get_parameter("driver_args", driver_args);
-  std::vector<const char *> args;
+  // libsurvive's parser treats argv[0] as the program name and scans from
+  // argv[1], so prepend a placeholder or the first flag is dropped.
+  std::vector<std::string> tokens{"libsurvive_ros2_node"};
   std::stringstream driver_ss(driver_args);
   std::string token;
   while (getline(driver_ss, token, ' ')) {
-    args.emplace_back(token.c_str());
+    if (!token.empty()) {
+      tokens.push_back(token);
+    }
+  }
+  // Build argv only after tokens is fully populated: each c_str() must point at
+  // an owned string that outlives survive_simple_init (the old code took c_str()
+  // of a single reused local, leaving dangling pointers).
+  std::vector<const char *> args;
+  args.reserve(tokens.size());
+  for (const auto & t : tokens) {
+    args.push_back(t.c_str());
   }
 
   // Try and initialize survive with the arguments supplied.
