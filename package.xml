@@ -19,7 +19,13 @@
   <depend>sensor_msgs</depend>
   <depend>tf2</depend>
   <depend>tf2_ros</depend>
-  
+
+  <!-- The bundled libsurvive CMake build links against libusb (USB device I/O
+       for the Vive trackers / base stations), so it must be present at build
+       time. Declaring it here lets rosdep install it on every platform that
+       builds this package from source. -->
+  <depend>libusb-1.0</depend>
+
   <exec_depend>rosbridge_suite</exec_depend>
   <exec_depend>foxglove_bridge</exec_depend>
   <test_depend>ament_lint_auto</test_depend>
