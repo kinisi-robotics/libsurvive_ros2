@@ -1,0 +1,51 @@
+From e560989d5eb28114e1c4461274f9c4fb1706ca25 Mon Sep 17 00:00:00 2001
+From: Mark Stalzer <you@example.com>
+Date: Fri, 13 Mar 2026 07:33:25 -0400
+Subject: [PATCH 2/3] variance_measure_add: skip non-finite input instead of
+ asserting
+
+An assert(isfinite(d[i])) crash here corrupts the on-disk libsurvive
+config because the process dies mid-write. Corrupt optical angles
+(e.g. bad FPGA timestamps during USB disturbances) can produce NaN or
+Inf values that reach this function; crashing is strictly worse than
+dropping one sample, which has negligible effect on the variance estimate.
+
+Replace the assert with an early-return guard that logs to stderr and
+leaves the accumulator unchanged.
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+(cherry picked from commit d63f79f1fee1c438bfa474c26173ac1202913925)
+---
+ redist/variance.h | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/redist/variance.h b/redist/variance.h
+index 83838d0..b393f22 100644
+--- a/redist/variance.h
++++ b/redist/variance.h
+@@ -12,10 +12,21 @@ static inline void variance_measure_add(struct variance_measure *meas, const FLT
+ 	if (meas->size == 0)
+ 		meas->size = 1;
+ 
++	/* Guard against non-finite values. Corrupt optical angles (e.g. bad FPGA
++	 * timestamps during USB disturbances) can reach here as NaN or Inf. The
++	 * assert below would crash the process and corrupt the on-disk config;
++	 * dropping one sample is strictly safer and has negligible effect on the
++	 * variance estimate. */
++	for (int i = 0; i < meas->size; i++) {
++		if (!isfinite(d[i])) {
++			fprintf(stderr, "[libsurvive] variance_measure_add: non-finite d[%d]=%f, dropping measurement\n", i, (double)d[i]);
++			return;
++		}
++	}
++
+ 	meas->n++;
+ 	addnd(meas->sum, meas->sum, d, meas->size);
+ 	for (int i = 0; i < meas->size; i++) {
+-		assert(isfinite(d[i]));
+ 		meas->sumSq[i] += d[i] * d[i];
+ 	}
+ }
+-- 
+2.43.0
+

@@ -29,19 +29,30 @@ if(NOT CMAKE_C_STANDARD)
   set(CMAKE_C_STANDARD 99)
 endif()
 
-# Default to C++17
+# C++20 (std::format)
 if(NOT CMAKE_CXX_STANDARD)
-  set(CMAKE_CXX_STANDARD 17)
+  set(CMAKE_CXX_STANDARD 20)
 endif()
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Set compile options
 add_compile_options(-Wall -Wextra -Wpedantic)
 
-# Find the core interface library
+# Find the core interface library. Upstream libsurvive is pinned and then
+# patched with the series in patches/ (see patches/README.md): record-mode
+# calibration freeze, OOTX channel-conflict reporting, the light-relock
+# self-heal and two upstream robustness fixes. The patch step is idempotent
+# (the checkout is reset to the pin first) so re-running the build is safe.
+find_package(Git REQUIRED)
+file(GLOB LIBSURVIVE_PATCHES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/patches/*.patch")
+list(SORT LIBSURVIVE_PATCHES)
+set(LIBSURVIVE_GIT_TAG 32cf62c52744fdc32003ef8169e8b81f6f31526b)
 include(ExternalProject)
 externalproject_add(libsurvive
   GIT_REPOSITORY https://github.com/cntools/libsurvive.git
-  GIT_TAG 32cf62c52744fdc32003ef8169e8b81f6f31526b
+  GIT_TAG ${LIBSURVIVE_GIT_TAG}
+  PATCH_COMMAND ${GIT_EXECUTABLE} -C <SOURCE_DIR> checkout -q -f ${LIBSURVIVE_GIT_TAG}
+    COMMAND ${GIT_EXECUTABLE} -C <SOURCE_DIR> apply --whitespace=nowarn ${LIBSURVIVE_PATCHES}
   CMAKE_ARGS
     -DCMAKE_INSTALL_PREFIX=${CMAKE_CURRENT_BINARY_DIR}/libsurvive-install
     -DCMAKE_BUILD_TYPE=Release
@@ -62,7 +73,8 @@ include_directories(include)
 
 # Add the component
 add_library(libsurvive_ros2_component SHARED
-  src/component.cpp)
+  src/component.cpp
+  src/tracking_health.cpp)
 add_dependencies(libsurvive_ros2_component libsurvive)
 target_include_directories(libsurvive_ros2_component PUBLIC
   ${CMAKE_CURRENT_BINARY_DIR}/libsurvive-install/include
@@ -129,6 +141,14 @@ install(
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   ament_lint_auto_find_test_dependencies()
+
+  # The diagnostics logic is libsurvive-free so it can be driven with faked
+  # callback timings; this test does not need the driver or hardware.
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_tracking_health
+    test/test_tracking_health.cpp
+    src/tracking_health.cpp)
+  target_include_directories(test_tracking_health PRIVATE include)
 endif()
 
 # Export all include directories and declare the package
