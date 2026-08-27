@@ -27,6 +27,7 @@
 #include <os_generic.h>
 
 // C++ system
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <map>
@@ -44,6 +45,7 @@
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "libsurvive/survive_api.h"
 #include "libsurvive/survive.h"
+#include "libsurvive_ros2/tracking_health.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/imu.hpp"
 #include "sensor_msgs/msg/joy.hpp"
@@ -63,6 +65,12 @@ public:
   // Record the latest smoothed optical residual for a tracker serial. Called
   // from the libsurvive datalog callback (libsurvive worker thread).
   void record_light_residual(const std::string & serial, double value);
+  // Light-pipeline events for a tracker, from libsurvive's hooks (its threads):
+  // a raw sweep decoded from lighthouse `lh`, a sweep solved into an angle, and
+  // a batch of light integrated into the pose filter.
+  void record_sweep_hit(const std::string & serial, int lh);
+  void record_solved_sweep(const std::string & serial, int lh);
+  void record_light_integrated(const std::string & serial);
 
 private:
   void work();
@@ -91,6 +99,19 @@ private:
   // ROS time each tracker's pose was last broadcast, for pose-freshness in
   // diagnostics. Written and read only on the worker thread, so no lock needed.
   std::map<std::string, rclcpp::Time> last_pose_time_;
+
+  // Optical-tracking health per tracker serial, fed from libsurvive's sweep /
+  // sweep-angle / datalog hooks and the pose events, read by publish_diagnostics().
+  // Guarded because producers and consumer run on different threads.
+  static double mono_now();
+  TrackingHealth & health_for(const std::string & serial);
+  std::mutex health_mutex_;
+  std::map<std::string, TrackingHealth> health_;
+  double imu_only_after_s_ = 0.25;
+  double pose_stale_after_s_ = 0.5;
+  // libsurvive's light-relock self-heal (see patches/), forwarded as driver args.
+  double light_relock_timeout_s_ = 3.0;
+  double light_relock_force_interval_s_ = -1.0;
 
   bool publish_diagnostics_ = true;
   bool capture_light_residual_ = true;

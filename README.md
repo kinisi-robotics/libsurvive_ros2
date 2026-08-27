@@ -26,6 +26,38 @@ Progress:
 - [ ] convert to lifecycle node (nice to have)
 - [ ] add circlce, mergify and dependebot integration
 
+# Diagnostics, record mode and occlusion recovery (kinisi fork)
+
+The node publishes `diagnostic_msgs/DiagnosticArray` on `diagnostics` (default 10 Hz, `diagnostics_rate`).
+
+Per tracker (`libsurvive/tracker/<serial>`; level OK = light-tracked, WARN = IMU dead-reckoning, ERROR = no pose):
+
+| key | meaning |
+|---|---|
+| `pose_confidence` | libsurvive `poseConfidence` (1 / position variance); decays while no light is integrated |
+| `light_residual` | smoothed optical residual (`res_error_light_avg`); only changes when light is integrated |
+| `pose_age_s` | seconds since the last pose broadcast — stays small on an IMU-only pose |
+| `charging`, `charge_percent` | battery |
+| `light_age_s` | seconds since the last *solved* sweep from any base station (`inf` if never) |
+| `light_integrated_age_s` | seconds since light was last folded into the pose filter |
+| `lighthouses_visible` | base stations with a solved sweep in the last 500 ms |
+| `pose_source` | `light`, `imu_only` (poses flow but nothing optical for `imu_only_after_s`, default 0.25 s) or `none` (no pose for `pose_stale_after_s`, default 0.5 s) |
+| `light_relocks` | times the driver re-sent the lightcap mode switch to this device (self-heal, below) |
+| `lh_hits_500ms`, `lh_solved_500ms` | per base station `LHB-xxxx=n` raw sweep hits / solved sweeps in the last 500 ms |
+
+Per base station (`libsurvive/lighthouse/<serial>`): the calibration flags and variance as before, plus
+`hits_500ms`, `solved_sweeps_500ms`, `visible`, and `ootx_conflict_id` / `ootx_conflict_count`. A base
+station whose channel is also used by a foreign station is reported at level ERROR.
+
+**Record mode** (`--disable-calibrate 1` in `driver_args`) now freezes the calibration for real: the config
+file is never written, lighthouse poses are never nudged, and a foreign OOTX id on a configured channel is
+logged and flagged instead of overwriting the stored slot (see `patches/README.md`).
+
+**Occlusion self-heal.** A tracker that loses all light for `light_relock_timeout_s` (default 3 s) while
+still reporting IMU gets the lightcap mode switch re-sent by the driver — the same USB feature report a
+fresh process sends at startup. Set the parameter `<= 0` to disable. `light_relock_force_interval_s`
+(default off) is a test knob that relocks periodically regardless of light.
+
 # Installation instructions
 
 This has only been tested on Ubuntu 22.04 and ROS Humble, although its fairly likely to work correctly with other distributions too. Pull requests are welcome if it does not!
