@@ -208,3 +208,18 @@ TEST(StampRecordPath, OnlyRewritesTheRecordArgument)
   EXPECT_EQ(stamp_record_path("--record --foo", "T"), "--record --foo") << "no path: untouched";
   EXPECT_EQ(stamp_record_path("", "T"), "");
 }
+
+TEST(FrozenDriverArgs, RewritesOnlyWhenMarkerExists)
+{
+  using libsurvive_ros2::frozen_driver_args;
+  const std::string session = "--force-calibrate 1 --configfile /c.json --light-relock-timeout 3";
+  EXPECT_EQ(frozen_driver_args(session, false), session);
+  EXPECT_EQ(
+    frozen_driver_args(session, true),
+    "--configfile /c.json --light-relock-timeout 3 --disable-calibrate 1");
+  EXPECT_EQ(frozen_driver_args("--force-calibrate --configfile /c.json", true),
+    "--configfile /c.json --disable-calibrate 1") << "flag without value";
+  EXPECT_EQ(frozen_driver_args("--disable-calibrate 1 --configfile /c.json", true),
+    "--disable-calibrate 1 --configfile /c.json") << "already frozen: unchanged";
+  EXPECT_EQ(frozen_driver_args("", true), "--disable-calibrate 1");
+}

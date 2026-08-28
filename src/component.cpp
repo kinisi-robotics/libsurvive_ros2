@@ -24,6 +24,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <format>  // NOLINT(build/include_order): cpplint predates C++20 <format>
 #include <limits>
 #include <memory>
@@ -203,6 +205,8 @@ Component::Component(const rclcpp::NodeOptions & options)
   this->get_parameter("wedge_restart_after_s", wedge_restart_after_s_);
   this->declare_parameter("wedge_restart_min_relocks", wedge_restart_min_relocks_);
   this->get_parameter("wedge_restart_min_relocks", wedge_restart_min_relocks_);
+  this->declare_parameter("calibration_marker_file", calibration_marker_file_);
+  this->get_parameter("calibration_marker_file", calibration_marker_file_);
 
   // Setup driver parameters.
   std::string driver_args;
@@ -225,6 +229,15 @@ Component::Component(const rclcpp::NodeOptions & options)
     char stamp[32];
     std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", std::localtime(&t));
     driver_args = stamp_record_path(driver_args, stamp);
+  }
+  if (!calibration_marker_file_.empty()) {
+    const bool marker = std::filesystem::exists(calibration_marker_file_);
+    RCLCPP_INFO(
+      this->get_logger(), "calibration marker %s %s: %s", calibration_marker_file_.c_str(),
+      marker ? "present" : "absent",
+      marker ? "this session already froze its calibration, starting frozen" :
+      "solving the calibration from scratch for this session");
+    driver_args = frozen_driver_args(driver_args, marker);
   }
   RCLCPP_INFO(this->get_logger(), "libsurvive driver args: %s", driver_args.c_str());
   // libsurvive's parser treats argv[0] as the program name and scans from
@@ -252,6 +265,11 @@ Component::Component(const rclcpp::NodeOptions & options)
     RCLCPP_FATAL(this->get_logger(), "Could not initialize the libsurvive context");
     return;
   }
+
+  // Lock the session's calibration in place once a monitor judges it converged.
+  freeze_service_ = this->create_service<std_srvs::srv::Trigger>(
+    "freeze_calibration",
+    std::bind(&Component::freeze_calibration, this, std::placeholders::_1, std::placeholders::_2));
 
   // Setup callback for reading IMU data.
   SurviveContext * ctx = survive_simple_get_ctx(actx_);
@@ -359,6 +377,37 @@ std::string num(double value)
   return std::string(buf);
 }
 }  // namespace
+
+void Component::freeze_calibration(
+  const std::shared_ptr<std_srvs::srv::Trigger::Request> /*request*/,
+  std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+{
+  SurviveContext * ctx = survive_simple_get_ctx(actx_);
+  survive_simple_lock(actx_);
+  const bool froze = survive_calibration_freeze(ctx);
+  survive_simple_unlock(actx_);
+  response->success = true;
+  if (!froze) {
+    response->message = "calibration was already frozen";
+    return;
+  }
+  response->message = "calibration saved and frozen";
+  if (!calibration_marker_file_.empty()) {
+    std::ofstream marker(calibration_marker_file_);
+    if (marker) {
+      const auto t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+      char stamp[32];
+      std::strftime(stamp, sizeof(stamp), "%Y-%m-%dT%H:%M:%S", std::localtime(&t));
+      marker << "frozen " << stamp << "\n";
+    } else {
+      RCLCPP_WARN(
+        this->get_logger(), "could not write calibration marker %s: a respawn in this session "
+        "would re-solve the calibration", calibration_marker_file_.c_str());
+      response->message += " (marker file not writable)";
+    }
+  }
+  RCLCPP_INFO(this->get_logger(), "%s", response->message.c_str());
+}
 
 void Component::maybe_exit_for_wedge(const std::string & serial, double light_age_s, int relocks)
 {
@@ -544,6 +593,7 @@ void Component::publish_diagnostics()
       add_kv(status, "pose_source", snap.pose_source);
       add_kv(status, "light_relocks", std::to_string(so->stats.light_relocks));
       add_kv(status, "wedge_restart_after_s", num(wedge_restart_after_s_));
+      add_kv(status, "calibration_frozen", survive_calibration_frozen(ctx) ? "true" : "false");
       maybe_exit_for_wedge(serial, snap.light_age_s, static_cast<int>(so->stats.light_relocks));
       std::string hits_s;
       std::string solved_s;

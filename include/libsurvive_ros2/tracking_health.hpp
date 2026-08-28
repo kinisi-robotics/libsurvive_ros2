@@ -108,6 +108,12 @@ bool wedge_restart_due(double light_age_s, int relocks, double after_s, int min_
 // the previous run wrote. Any other argument string is returned unchanged.
 std::string stamp_record_path(const std::string & driver_args, const std::string & stamp);
 
+// Per-session calibration on respawn: when the session's frozen-calibration
+// marker exists, a node that was launched to solve from scratch must instead
+// come up frozen. Drops every "--force-calibrate [value]" and adds
+// "--disable-calibrate 1" if absent. Without the marker the string is unchanged.
+std::string frozen_driver_args(const std::string & driver_args, bool marker_exists);
+
 }  // namespace libsurvive_ros2
 
 #endif  // LIBSURVIVE_ROS2__TRACKING_HEALTH_HPP_

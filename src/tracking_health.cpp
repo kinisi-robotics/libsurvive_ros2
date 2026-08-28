@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cmath>
 #include <string>
+#include <vector>
 
 namespace libsurvive_ros2
 {
@@ -123,5 +124,47 @@ std::string stamp_record_path(const std::string & driver_args, const std::string
   }
   return driver_args.substr(0, path_end) + "." + stamp + driver_args.substr(path_end);
 }
+std::string frozen_driver_args(const std::string & driver_args, bool marker_exists)
+{
+  if (!marker_exists) {
+    return driver_args;
+  }
+  std::vector<std::string> tokens;
+  std::string token;
+  for (std::size_t i = 0; i <= driver_args.size(); ++i) {
+    if (i == driver_args.size() || driver_args[i] == ' ') {
+      if (!token.empty()) {
+        tokens.push_back(token);
+        token.clear();
+      }
+    } else {
+      token += driver_args[i];
+    }
+  }
+  std::vector<std::string> kept;
+  bool has_disable = false;
+  for (std::size_t i = 0; i < tokens.size(); ++i) {
+    if (tokens[i] == "--force-calibrate") {
+      if (i + 1 < tokens.size() && tokens[i + 1].rfind("--", 0) != 0) {
+        ++i;  // swallow its value
+      }
+      continue;
+    }
+    if (tokens[i] == "--disable-calibrate") {
+      has_disable = true;
+    }
+    kept.push_back(tokens[i]);
+  }
+  if (!has_disable) {
+    kept.push_back("--disable-calibrate");
+    kept.push_back("1");
+  }
+  std::string out;
+  for (const auto & t : kept) {
+    out += (out.empty() ? "" : " ") + t;
+  }
+  return out;
+}
 }  // namespace libsurvive_ros2
+
 

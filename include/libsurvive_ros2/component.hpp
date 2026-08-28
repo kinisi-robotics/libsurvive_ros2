@@ -47,6 +47,7 @@
 #include "libsurvive/survive.h"
 #include "libsurvive_ros2/tracking_health.hpp"
 #include "rclcpp/rclcpp.hpp"
+#include "std_srvs/srv/trigger.hpp"
 #include "sensor_msgs/msg/imu.hpp"
 #include "sensor_msgs/msg/joy.hpp"
 #include "tf2_ros/static_transform_broadcaster.h"
@@ -126,6 +127,16 @@ private:
   int wedge_restart_min_relocks_ = 2;
   bool wedge_exit_requested_ = false;
   void maybe_exit_for_wedge(const std::string & serial, double light_age_s, int relocks);
+
+  // Per-session calibration: the node is launched with --force-calibrate, a
+  // monitor calls freeze_calibration once the solve has converged, and this
+  // marker file is written so that a respawn (wedge restart) of the same session
+  // comes back frozen instead of re-solving. Empty disables the marker logic.
+  std::string calibration_marker_file_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr freeze_service_;
+  void freeze_calibration(
+    const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+    std::shared_ptr<std_srvs::srv::Trigger::Response> response);
 
   bool publish_diagnostics_ = true;
   bool capture_light_residual_ = true;
