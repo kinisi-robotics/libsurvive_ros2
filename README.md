@@ -65,7 +65,7 @@ fresh process sends at startup. Set the parameter `<= 0` to disable. `light_relo
 **Wedge restart (last resort).** Live testing showed the mode switch alone does not recover a wedged T20: the
 firmware acknowledges it (`LightcapMode 2 -> 2`) but the lightcap interface stays silent while the IMU
 interface streams on, indefinitely. The only cure ever observed is a fresh device open, and libsurvive has no
-working internal reopen path. So when a tracker has been IMU-only for `wedge_restart_after_s` (default 20 s)
+working internal reopen path. So when a tracker has been IMU-only for `wedge_restart_after_s` (**off by default**; the kinisi `umi.launch.py` sets 20 s together with `respawn=True`)
 after at least `wedge_restart_min_relocks` (default 2) relocks, the node logs FATAL and exits with status 75;
 launch it with `respawn=True` (the kinisi `umi.launch.py` does) and it is back within a few seconds. A tracker
 that is genuinely covered for longer than that restarts on the same schedule until light returns — harmless,

@@ -122,7 +122,7 @@ private:
   // at least wedge_restart_min_relocks_ times, is treated as wedged at the
   // USB/firmware layer (the only known cure is a fresh device open) and the
   // process exits so the launch file can respawn it. <= 0 disables.
-  double wedge_restart_after_s_ = 20.0;
+  double wedge_restart_after_s_ = 0.0;  // opt-in: the launch file that sets respawn enables it
   int wedge_restart_min_relocks_ = 2;
   bool wedge_exit_requested_ = false;
   void maybe_exit_for_wedge(const std::string & serial, double light_age_s, int relocks);
