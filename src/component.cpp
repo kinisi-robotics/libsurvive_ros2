@@ -288,6 +288,7 @@ Component::Component(const rclcpp::NodeOptions & options)
   survive_simple_start_thread(actx_);
 
   // Start the work thread
+  start_mono_s_ = mono_now();
   worker_thread_ = std::thread(&Component::work, this);
 }
 
@@ -409,21 +410,24 @@ void Component::freeze_calibration(
   RCLCPP_INFO(this->get_logger(), "%s", response->message.c_str());
 }
 
-void Component::maybe_exit_for_wedge(const std::string & serial, double light_age_s, int relocks)
+void Component::maybe_exit_for_wedge(const std::string & serial, double hit_age_s, int relocks)
 {
+  const double since_start_s = mono_now() - start_mono_s_;
   if (wedge_exit_requested_ ||
-    !wedge_restart_due(light_age_s, relocks, wedge_restart_after_s_, wedge_restart_min_relocks_))
+    !wedge_restart_due(
+      hit_age_s, since_start_s, relocks, wedge_restart_after_s_, wedge_restart_min_relocks_))
   {
     return;
   }
+  const double dark_s = std::isfinite(hit_age_s) ? hit_age_s : since_start_s;
   wedge_exit_requested_ = true;
   RCLCPP_FATAL(
     this->get_logger(),
-    "%s: IMU streaming but no light for %.1f s despite %d lightcap relocks — the "
+    "%s: IMU streaming but no lightcap for %.1f s%s despite %d lightcap relocks — the "
     "tracker's light path is wedged (USB/firmware); exiting so the launch file "
     "respawns a fresh device open. Cover the tracker for a real occlusion test and "
     "this is expected; otherwise capture --record for offline replay.",
-    serial.c_str(), light_age_s, relocks);
+    serial.c_str(), dark_s, std::isfinite(hit_age_s) ? "" : " (none since start)", relocks);
   // Flush every stdio stream (ROS console output, libsurvive's --record file)
   // and leave immediately: tearing rclcpp/libsurvive down from the worker
   // thread is not worth the risk, the point is a clean re-enumeration.
@@ -594,7 +598,8 @@ void Component::publish_diagnostics()
       add_kv(status, "light_relocks", std::to_string(so->stats.light_relocks));
       add_kv(status, "wedge_restart_after_s", num(wedge_restart_after_s_));
       add_kv(status, "calibration_frozen", survive_calibration_frozen(ctx) ? "true" : "false");
-      maybe_exit_for_wedge(serial, snap.light_age_s, static_cast<int>(so->stats.light_relocks));
+      add_kv(status, "hit_age_s", num(snap.hit_age_s));
+      maybe_exit_for_wedge(serial, snap.hit_age_s, static_cast<int>(so->stats.light_relocks));
       std::string hits_s;
       std::string solved_s;
       for (const auto & [idx, lh_serial] : lh_serials) {

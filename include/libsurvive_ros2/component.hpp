@@ -126,7 +126,8 @@ private:
   double wedge_restart_after_s_ = 0.0;  // opt-in: the launch file that sets respawn enables it
   int wedge_restart_min_relocks_ = 2;
   bool wedge_exit_requested_ = false;
-  void maybe_exit_for_wedge(const std::string & serial, double light_age_s, int relocks);
+  double start_mono_s_ = 0.0;
+  void maybe_exit_for_wedge(const std::string & serial, double hit_age_s, int relocks);
 
   // Per-session calibration: the node is launched with --force-calibrate, a
   // monitor calls freeze_calibration once the solve has converged, and this

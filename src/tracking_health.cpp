@@ -38,6 +38,7 @@ TrackingHealth::TrackingHealth(
 
 void TrackingHealth::on_hit(int lighthouse, double t)
 {
+  last_hit_ = std::max(last_hit_, t);
   if (lighthouse < 0 || static_cast<std::size_t>(lighthouse) >= kMaxLighthouses) {
     return;
   }
@@ -85,6 +86,7 @@ TrackingHealth::Snapshot TrackingHealth::snapshot(double now)
     }
   }
   s.light_age_s = now - last_solved_;
+  s.hit_age_s = now - last_hit_;
   s.light_integrated_age_s = now - last_integrated_;
   s.pose_age_s = now - last_pose_;
   if (s.pose_age_s > pose_stale_after_s_) {
@@ -97,14 +99,14 @@ TrackingHealth::Snapshot TrackingHealth::snapshot(double now)
   return s;
 }
 
-bool wedge_restart_due(double light_age_s, int relocks, double after_s, int min_relocks)
+bool wedge_restart_due(
+  double hit_age_s, double since_start_s, int relocks, double after_s, int min_relocks)
 {
-  if (after_s <= 0.0 || !std::isfinite(light_age_s)) {
-    // +inf light age means light never arrived since start: that is a
-    // start-up / calibration state, not a wedge of a previously tracking device.
+  if (after_s <= 0.0) {
     return false;
   }
-  return light_age_s > after_s && relocks >= min_relocks;
+  const double dark_s = std::isfinite(hit_age_s) ? hit_age_s : since_start_s;
+  return dark_s > after_s && relocks >= min_relocks;
 }
 
 std::string stamp_record_path(const std::string & driver_args, const std::string & stamp)

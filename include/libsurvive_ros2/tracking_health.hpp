@@ -55,6 +55,9 @@ public:
     int lighthouses_visible = 0;
     // Seconds since the last solved sweep from any lighthouse; +inf if never.
     double light_age_s = std::numeric_limits<double>::infinity();
+    // Seconds since the last raw lightcap hit from any lighthouse (solved or
+    // not); +inf if never. Raw hits stop when the tracker's light path wedges.
+    double hit_age_s = std::numeric_limits<double>::infinity();
     // Seconds since light was last integrated into the pose filter; +inf if never.
     double light_integrated_age_s = std::numeric_limits<double>::infinity();
     // Seconds since the last pose report; +inf if never.
@@ -89,6 +92,7 @@ private:
   std::array<std::deque<double>, kMaxLighthouses> hits_;
   std::array<std::deque<double>, kMaxLighthouses> solved_;
   double last_solved_ = -std::numeric_limits<double>::infinity();
+  double last_hit_ = -std::numeric_limits<double>::infinity();
   double last_integrated_ = -std::numeric_limits<double>::infinity();
   double last_pose_ = -std::numeric_limits<double>::infinity();
 };
@@ -97,11 +101,17 @@ private:
 // path wedged; the launch file respawns it (respawn=True).
 inline constexpr int kWedgeExitCode = 75;
 
-// True when a tracker should be treated as wedged: IMU poses keep flowing but
-// no sweep has been solved for longer than after_s, although the driver already
+// True when a tracker should be treated as wedged: IMU poses keep flowing (the
+// driver counts a relock only while IMU arrives without light) but no raw
+// lightcap has been seen for longer than after_s, although the driver already
 // re-sent the lightcap mode switch relocks >= min_relocks times (so the cheap
-// self-heal has been tried and failed). after_s <= 0 disables.
-bool wedge_restart_due(double light_age_s, int relocks, double after_s, int min_relocks);
+// self-heal has been tried and failed). A tracker that never delivered light
+// since this process started (hit_age_s = +inf) counts from the start: the wedge
+// has been seen to strike on a fresh device open, and the next open cured it.
+// This also fires while the base stations are off — harmless, the node just
+// re-enumerates every after_s. after_s <= 0 disables.
+bool wedge_restart_due(
+  double hit_age_s, double since_start_s, int relocks, double after_s, int min_relocks);
 
 // Rewrite "--record <path>" in a libsurvive argument string to
 // "--record <path>.<stamp>" so a respawned process does not truncate the file
