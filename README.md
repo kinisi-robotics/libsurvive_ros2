@@ -29,6 +29,10 @@ Progress:
 # Diagnostics, record mode and occlusion recovery (kinisi fork)
 
 The node publishes `diagnostic_msgs/DiagnosticArray` on `diagnostics` (default 10 Hz, `diagnostics_rate`).
+The tracker rows are also published one-per-message on `tracking_status` (`diagnostic_msgs/DiagnosticStatus`,
+parameter `tracking_status_topic`) so a consumer that gates on tracking quality — e.g. a data recorder that
+must refuse to start, or abort, an episode while the pose is IMU dead-reckoning — can subscribe to one small
+topic instead of filtering the array.
 
 Per tracker (`libsurvive/tracker/<serial>`; level OK = light-tracked, WARN = IMU dead-reckoning, ERROR = no pose):
 
@@ -57,6 +61,16 @@ logged and flagged instead of overwriting the stored slot (see `patches/README.m
 still reporting IMU gets the lightcap mode switch re-sent by the driver — the same USB feature report a
 fresh process sends at startup. Set the parameter `<= 0` to disable. `light_relock_force_interval_s`
 (default off) is a test knob that relocks periodically regardless of light.
+
+**Wedge restart (last resort).** Live testing showed the mode switch alone does not recover a wedged T20: the
+firmware acknowledges it (`LightcapMode 2 -> 2`) but the lightcap interface stays silent while the IMU
+interface streams on, indefinitely. The only cure ever observed is a fresh device open, and libsurvive has no
+working internal reopen path. So when a tracker has been IMU-only for `wedge_restart_after_s` (default 20 s)
+after at least `wedge_restart_min_relocks` (default 2) relocks, the node logs FATAL and exits with status 75;
+launch it with `respawn=True` (the kinisi `umi.launch.py` does) and it is back within a few seconds. A tracker
+that is genuinely covered for longer than that restarts on the same schedule until light returns — harmless,
+but expect it. Set `wedge_restart_after_s <= 0` to disable. `--record <path>` in `driver_args` is rewritten to
+`<path>.<YYYYmmdd-HHMMSS>` per start so a respawn does not truncate the recording of the run that wedged.
 
 # Installation instructions
 

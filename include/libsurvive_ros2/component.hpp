@@ -85,6 +85,10 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_publisher_;
   rclcpp::Publisher<diagnostic_msgs::msg::KeyValue>::SharedPtr cfg_publisher_;
   rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diagnostics_publisher_;
+  // The tracker rows of the diagnostics array, one message per tracker, so a
+  // consumer that gates on tracking quality (e.g. a data recorder) can subscribe
+  // to a single small topic instead of filtering the array.
+  rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticStatus>::SharedPtr tracking_status_publisher_;
   std::thread worker_thread_;
   rclcpp::Time last_base_station_update_;
   std::string tracking_frame_;
@@ -112,6 +116,16 @@ private:
   // libsurvive's light-relock self-heal (see patches/), forwarded as driver args.
   double light_relock_timeout_s_ = 3.0;
   double light_relock_force_interval_s_ = -1.0;
+
+  // Wedge self-heal of last resort: a tracker that streams IMU but no light for
+  // this long, although the driver has already re-sent the lightcap mode switch
+  // at least wedge_restart_min_relocks_ times, is treated as wedged at the
+  // USB/firmware layer (the only known cure is a fresh device open) and the
+  // process exits so the launch file can respawn it. <= 0 disables.
+  double wedge_restart_after_s_ = 20.0;
+  int wedge_restart_min_relocks_ = 2;
+  bool wedge_exit_requested_ = false;
+  void maybe_exit_for_wedge(const std::string & serial, double light_age_s, int relocks);
 
   bool publish_diagnostics_ = true;
   bool capture_light_residual_ = true;

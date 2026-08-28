@@ -30,6 +30,8 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include <cstdlib>
+#include <ctime>
 
 // Other
 #include "libsurvive_ros2/component.hpp"
@@ -177,6 +179,11 @@ Component::Component(const rclcpp::NodeOptions & options)
   this->get_parameter("diagnostics_topic", diagnostics_topic);
   diagnostics_publisher_ =
     this->create_publisher<diagnostic_msgs::msg::DiagnosticArray>(diagnostics_topic, 10);
+  std::string tracking_status_topic;
+  this->declare_parameter("tracking_status_topic", "tracking_status");
+  this->get_parameter("tracking_status_topic", tracking_status_topic);
+  tracking_status_publisher_ =
+    this->create_publisher<diagnostic_msgs::msg::DiagnosticStatus>(tracking_status_topic, 10);
 
   // Tracking-health thresholds behind pose_source (see TrackingHealth).
   this->declare_parameter("imu_only_after_s", imu_only_after_s_);
@@ -192,6 +199,10 @@ Component::Component(const rclcpp::NodeOptions & options)
   this->get_parameter("light_relock_timeout_s", light_relock_timeout_s_);
   this->declare_parameter("light_relock_force_interval_s", light_relock_force_interval_s_);
   this->get_parameter("light_relock_force_interval_s", light_relock_force_interval_s_);
+  this->declare_parameter("wedge_restart_after_s", wedge_restart_after_s_);
+  this->get_parameter("wedge_restart_after_s", wedge_restart_after_s_);
+  this->declare_parameter("wedge_restart_min_relocks", wedge_restart_min_relocks_);
+  this->get_parameter("wedge_restart_min_relocks", wedge_restart_min_relocks_);
 
   // Setup driver parameters.
   std::string driver_args;
@@ -206,6 +217,14 @@ Component::Component(const rclcpp::NodeOptions & options)
   {
     driver_args +=
       std::format(" --light-relock-force-interval {}", light_relock_force_interval_s_);
+  }
+  // A respawned process would truncate the previous run's --record file — the
+  // one artefact that explains why it respawned — so stamp the path per start.
+  {
+    const auto t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    char stamp[32];
+    std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", std::localtime(&t));
+    driver_args = stamp_record_path(driver_args, stamp);
   }
   RCLCPP_INFO(this->get_logger(), "libsurvive driver args: %s", driver_args.c_str());
   // libsurvive's parser treats argv[0] as the program name and scans from
@@ -340,6 +359,28 @@ std::string num(double value)
   return std::string(buf);
 }
 }  // namespace
+
+void Component::maybe_exit_for_wedge(const std::string & serial, double light_age_s, int relocks)
+{
+  if (wedge_exit_requested_ ||
+    !wedge_restart_due(light_age_s, relocks, wedge_restart_after_s_, wedge_restart_min_relocks_))
+  {
+    return;
+  }
+  wedge_exit_requested_ = true;
+  RCLCPP_FATAL(
+    this->get_logger(),
+    "%s: IMU streaming but no light for %.1f s despite %d lightcap relocks — the "
+    "tracker's light path is wedged (USB/firmware); exiting so the launch file "
+    "respawns a fresh device open. Cover the tracker for a real occlusion test and "
+    "this is expected; otherwise capture --record for offline replay.",
+    serial.c_str(), light_age_s, relocks);
+  // Flush every stdio stream (ROS console output, libsurvive's --record file)
+  // and leave immediately: tearing rclcpp/libsurvive down from the worker
+  // thread is not worth the risk, the point is a clean re-enumeration.
+  std::fflush(nullptr);
+  std::_Exit(kWedgeExitCode);
+}
 
 void Component::publish_diagnostics()
 {
@@ -502,6 +543,8 @@ void Component::publish_diagnostics()
       add_kv(status, "lighthouses_visible", std::to_string(snap.lighthouses_visible));
       add_kv(status, "pose_source", snap.pose_source);
       add_kv(status, "light_relocks", std::to_string(so->stats.light_relocks));
+      add_kv(status, "wedge_restart_after_s", num(wedge_restart_after_s_));
+      maybe_exit_for_wedge(serial, snap.light_age_s, static_cast<int>(so->stats.light_relocks));
       std::string hits_s;
       std::string solved_s;
       for (const auto & [idx, lh_serial] : lh_serials) {
@@ -514,6 +557,7 @@ void Component::publish_diagnostics()
       }
       add_kv(status, "lh_hits_500ms", hits_s);
       add_kv(status, "lh_solved_500ms", solved_s);
+      tracking_status_publisher_->publish(status);
     }
 
     array.status.push_back(status);

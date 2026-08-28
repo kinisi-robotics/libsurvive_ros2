@@ -21,6 +21,7 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <limits>
 
 #include "libsurvive_ros2/tracking_health.hpp"
 
@@ -180,4 +181,30 @@ TEST(TrackingHealth, WindowIsConfigurable)
   TrackingHealth h(1.0);
   run_tracking(h, 0.0, 2.0, 1);
   EXPECT_NEAR(h.snapshot(2.0).hits[0], 100, 1);
+}
+
+TEST(WedgeRestart, RequiresLongDarknessAndFailedRelocks)
+{
+  using libsurvive_ros2::wedge_restart_due;
+  EXPECT_TRUE(wedge_restart_due(25.0, 5, 20.0, 2));
+  EXPECT_FALSE(wedge_restart_due(19.9, 5, 20.0, 2)) << "not dark long enough";
+  EXPECT_FALSE(wedge_restart_due(25.0, 1, 20.0, 2)) << "mode switch not yet retried enough";
+  EXPECT_TRUE(wedge_restart_due(25.0, 2, 20.0, 2)) << "min_relocks is inclusive";
+  EXPECT_FALSE(wedge_restart_due(25.0, 5, 0.0, 2)) << "after_s <= 0 disables";
+  EXPECT_FALSE(wedge_restart_due(25.0, 5, -1.0, 2));
+  EXPECT_FALSE(wedge_restart_due(std::numeric_limits<double>::infinity(), 5, 20.0, 2))
+    << "never had light: start-up, not a wedge";
+  EXPECT_TRUE(wedge_restart_due(0.6, 0, 0.5, 0)) << "zero min_relocks allowed";
+}
+
+TEST(StampRecordPath, OnlyRewritesTheRecordArgument)
+{
+  using libsurvive_ros2::stamp_record_path;
+  EXPECT_EQ(
+    stamp_record_path("--disable-calibrate 1 --record /tmp/a.rec --light-relock-timeout 3", "T"),
+    "--disable-calibrate 1 --record /tmp/a.rec.T --light-relock-timeout 3");
+  EXPECT_EQ(stamp_record_path("--record /tmp/a.rec", "T"), "--record /tmp/a.rec.T");
+  EXPECT_EQ(stamp_record_path("--disable-calibrate 1", "T"), "--disable-calibrate 1");
+  EXPECT_EQ(stamp_record_path("--record --foo", "T"), "--record --foo") << "no path: untouched";
+  EXPECT_EQ(stamp_record_path("", "T"), "");
 }

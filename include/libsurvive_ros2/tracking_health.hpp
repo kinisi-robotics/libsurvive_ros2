@@ -93,6 +93,21 @@ private:
   double last_pose_ = -std::numeric_limits<double>::infinity();
 };
 
+// Exit status the node uses when it leaves on purpose because a tracker's light
+// path wedged; the launch file respawns it (respawn=True).
+inline constexpr int kWedgeExitCode = 75;
+
+// True when a tracker should be treated as wedged: IMU poses keep flowing but
+// no sweep has been solved for longer than after_s, although the driver already
+// re-sent the lightcap mode switch relocks >= min_relocks times (so the cheap
+// self-heal has been tried and failed). after_s <= 0 disables.
+bool wedge_restart_due(double light_age_s, int relocks, double after_s, int min_relocks);
+
+// Rewrite "--record <path>" in a libsurvive argument string to
+// "--record <path>.<stamp>" so a respawned process does not truncate the file
+// the previous run wrote. Any other argument string is returned unchanged.
+std::string stamp_record_path(const std::string & driver_args, const std::string & stamp);
+
 }  // namespace libsurvive_ros2
 
 #endif  // LIBSURVIVE_ROS2__TRACKING_HEALTH_HPP_

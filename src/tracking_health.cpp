@@ -21,6 +21,8 @@
 #include "libsurvive_ros2/tracking_health.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <string>
 
 namespace libsurvive_ros2
 {
@@ -94,4 +96,32 @@ TrackingHealth::Snapshot TrackingHealth::snapshot(double now)
   return s;
 }
 
+bool wedge_restart_due(double light_age_s, int relocks, double after_s, int min_relocks)
+{
+  if (after_s <= 0.0 || !std::isfinite(light_age_s)) {
+    // +inf light age means light never arrived since start: that is a
+    // start-up / calibration state, not a wedge of a previously tracking device.
+    return false;
+  }
+  return light_age_s > after_s && relocks >= min_relocks;
+}
+
+std::string stamp_record_path(const std::string & driver_args, const std::string & stamp)
+{
+  const std::string flag = "--record";
+  const std::size_t at = driver_args.find(flag);
+  if (at == std::string::npos) {
+    return driver_args;
+  }
+  const std::size_t path_start = driver_args.find_first_not_of(' ', at + flag.size());
+  if (path_start == std::string::npos || driver_args[path_start] == '-') {
+    return driver_args;
+  }
+  std::size_t path_end = driver_args.find(' ', path_start);
+  if (path_end == std::string::npos) {
+    path_end = driver_args.size();
+  }
+  return driver_args.substr(0, path_end) + "." + stamp + driver_args.substr(path_end);
+}
 }  // namespace libsurvive_ros2
+
