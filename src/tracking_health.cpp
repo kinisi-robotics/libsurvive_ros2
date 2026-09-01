@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cmath>
 #include <string>
+#include <vector>
 
 namespace libsurvive_ros2
 {
@@ -37,6 +38,7 @@ TrackingHealth::TrackingHealth(
 
 void TrackingHealth::on_hit(int lighthouse, double t)
 {
+  last_hit_ = std::max(last_hit_, t);
   if (lighthouse < 0 || static_cast<std::size_t>(lighthouse) >= kMaxLighthouses) {
     return;
   }
@@ -84,6 +86,7 @@ TrackingHealth::Snapshot TrackingHealth::snapshot(double now)
     }
   }
   s.light_age_s = now - last_solved_;
+  s.hit_age_s = now - last_hit_;
   s.light_integrated_age_s = now - last_integrated_;
   s.pose_age_s = now - last_pose_;
   if (s.pose_age_s > pose_stale_after_s_) {
@@ -96,14 +99,14 @@ TrackingHealth::Snapshot TrackingHealth::snapshot(double now)
   return s;
 }
 
-bool wedge_restart_due(double light_age_s, int relocks, double after_s, int min_relocks)
+bool wedge_restart_due(
+  double hit_age_s, double since_start_s, int relocks, double after_s, int min_relocks)
 {
-  if (after_s <= 0.0 || !std::isfinite(light_age_s)) {
-    // +inf light age means light never arrived since start: that is a
-    // start-up / calibration state, not a wedge of a previously tracking device.
+  if (after_s <= 0.0) {
     return false;
   }
-  return light_age_s > after_s && relocks >= min_relocks;
+  const double dark_s = std::isfinite(hit_age_s) ? hit_age_s : since_start_s;
+  return dark_s > after_s && relocks >= min_relocks;
 }
 
 std::string stamp_record_path(const std::string & driver_args, const std::string & stamp)
@@ -123,5 +126,47 @@ std::string stamp_record_path(const std::string & driver_args, const std::string
   }
   return driver_args.substr(0, path_end) + "." + stamp + driver_args.substr(path_end);
 }
+std::string frozen_driver_args(const std::string & driver_args, bool marker_exists)
+{
+  if (!marker_exists) {
+    return driver_args;
+  }
+  std::vector<std::string> tokens;
+  std::string token;
+  for (std::size_t i = 0; i <= driver_args.size(); ++i) {
+    if (i == driver_args.size() || driver_args[i] == ' ') {
+      if (!token.empty()) {
+        tokens.push_back(token);
+        token.clear();
+      }
+    } else {
+      token += driver_args[i];
+    }
+  }
+  std::vector<std::string> kept;
+  bool has_disable = false;
+  for (std::size_t i = 0; i < tokens.size(); ++i) {
+    if (tokens[i] == "--force-calibrate") {
+      if (i + 1 < tokens.size() && tokens[i + 1].rfind("--", 0) != 0) {
+        ++i;  // swallow its value
+      }
+      continue;
+    }
+    if (tokens[i] == "--disable-calibrate") {
+      has_disable = true;
+    }
+    kept.push_back(tokens[i]);
+  }
+  if (!has_disable) {
+    kept.push_back("--disable-calibrate");
+    kept.push_back("1");
+  }
+  std::string out;
+  for (const auto & t : kept) {
+    out += (out.empty() ? "" : " ") + t;
+  }
+  return out;
+}
 }  // namespace libsurvive_ros2
+
 

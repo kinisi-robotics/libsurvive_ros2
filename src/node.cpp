@@ -31,7 +31,13 @@ int main(int argc, char * argv[])
 {
   rclcpp::init(argc, argv);
   rclcpp::executors::SingleThreadedExecutor exec;
-  exec.add_node(std::make_shared<libsurvive_ros2::Component>(rclcpp::NodeOptions{}));
+  // Keep the node alive for the whole spin: add_node() only stores a weak
+  // reference, so passing the temporary shared_ptr destroyed the Component right
+  // away and main() sat in its destructor (worker_thread_.join()) forever —
+  // the worker thread kept publishing, but no service or parameter request on
+  // this node was ever served.
+  auto node = std::make_shared<libsurvive_ros2::Component>(rclcpp::NodeOptions{});
+  exec.add_node(node);
   exec.spin();
   rclcpp::shutdown();
   return 0;

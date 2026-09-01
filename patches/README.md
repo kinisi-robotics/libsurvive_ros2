@@ -9,6 +9,7 @@ at the pinned commit in `CMakeLists.txt` and applies these patches in order
 | `0001-kalman-cap-process-noise-dt…` | upstream `bf27b41` | Bounds the Kalman process-noise growth on IMU gaps (t^7 blow-up → NaN filter). Upstream says it fixes tracker freezes on blackout recovery. Cherry-picked as low-risk hardening; not shown to be *our* wedge. |
 | `0002-variance_measure_add-skip-non-finite…` | upstream `d63f79f` | A non-finite optical sample used to `assert()` and kill the process mid-config-write, corrupting the calibration file. |
 | `0003-kinisi-freeze-calibration…` | ours | Three changes, see below. |
+| `0004-kinisi-survive_calibration_freeze…` | ours | `survive_calibration_freeze(ctx)`: write the config once, then set `disable-calibrate` at runtime so a session can solve from scratch (`--force-calibrate`, tripods move between sessions) and lock the result in without a restart. Used by the node's `freeze_calibration` service. |
 
 ## 0003 — record-mode calibration freeze, OOTX conflicts, light relock
 

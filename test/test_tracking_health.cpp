@@ -186,15 +186,17 @@ TEST(TrackingHealth, WindowIsConfigurable)
 TEST(WedgeRestart, RequiresLongDarknessAndFailedRelocks)
 {
   using libsurvive_ros2::wedge_restart_due;
-  EXPECT_TRUE(wedge_restart_due(25.0, 5, 20.0, 2));
-  EXPECT_FALSE(wedge_restart_due(19.9, 5, 20.0, 2)) << "not dark long enough";
-  EXPECT_FALSE(wedge_restart_due(25.0, 1, 20.0, 2)) << "mode switch not yet retried enough";
-  EXPECT_TRUE(wedge_restart_due(25.0, 2, 20.0, 2)) << "min_relocks is inclusive";
-  EXPECT_FALSE(wedge_restart_due(25.0, 5, 0.0, 2)) << "after_s <= 0 disables";
-  EXPECT_FALSE(wedge_restart_due(25.0, 5, -1.0, 2));
-  EXPECT_FALSE(wedge_restart_due(std::numeric_limits<double>::infinity(), 5, 20.0, 2))
-    << "never had light: start-up, not a wedge";
-  EXPECT_TRUE(wedge_restart_due(0.6, 0, 0.5, 0)) << "zero min_relocks allowed";
+  const double inf = std::numeric_limits<double>::infinity();
+  EXPECT_TRUE(wedge_restart_due(25.0, 100.0, 5, 20.0, 2));
+  EXPECT_FALSE(wedge_restart_due(19.9, 100.0, 5, 20.0, 2)) << "not dark long enough";
+  EXPECT_FALSE(wedge_restart_due(25.0, 100.0, 1, 20.0, 2)) << "mode switch not yet retried enough";
+  EXPECT_TRUE(wedge_restart_due(25.0, 100.0, 2, 20.0, 2)) << "min_relocks is inclusive";
+  EXPECT_FALSE(wedge_restart_due(25.0, 100.0, 5, 0.0, 2)) << "after_s <= 0 disables";
+  EXPECT_FALSE(wedge_restart_due(25.0, 100.0, 5, -1.0, 2));
+  EXPECT_TRUE(wedge_restart_due(inf, 25.0, 5, 20.0, 2)) << "wedged on a fresh open: dark since start";
+  EXPECT_FALSE(wedge_restart_due(inf, 15.0, 5, 20.0, 2)) << "fresh open, still within the window";
+  EXPECT_FALSE(wedge_restart_due(inf, 25.0, 0, 20.0, 2)) << "no IMU either (no relocks): not a wedge";
+  EXPECT_TRUE(wedge_restart_due(0.6, 100.0, 0, 0.5, 0)) << "zero min_relocks allowed";
 }
 
 TEST(StampRecordPath, OnlyRewritesTheRecordArgument)
@@ -207,4 +209,30 @@ TEST(StampRecordPath, OnlyRewritesTheRecordArgument)
   EXPECT_EQ(stamp_record_path("--disable-calibrate 1", "T"), "--disable-calibrate 1");
   EXPECT_EQ(stamp_record_path("--record --foo", "T"), "--record --foo") << "no path: untouched";
   EXPECT_EQ(stamp_record_path("", "T"), "");
+}
+
+TEST(FrozenDriverArgs, RewritesOnlyWhenMarkerExists)
+{
+  using libsurvive_ros2::frozen_driver_args;
+  const std::string session = "--force-calibrate 1 --configfile /c.json --light-relock-timeout 3";
+  EXPECT_EQ(frozen_driver_args(session, false), session);
+  EXPECT_EQ(
+    frozen_driver_args(session, true),
+    "--configfile /c.json --light-relock-timeout 3 --disable-calibrate 1");
+  EXPECT_EQ(frozen_driver_args("--force-calibrate --configfile /c.json", true),
+    "--configfile /c.json --disable-calibrate 1") << "flag without value";
+  EXPECT_EQ(frozen_driver_args("--disable-calibrate 1 --configfile /c.json", true),
+    "--disable-calibrate 1 --configfile /c.json") << "already frozen: unchanged";
+  EXPECT_EQ(frozen_driver_args("", true), "--disable-calibrate 1");
+}
+
+TEST(TrackingHealthHits, HitAgeFollowsRawHits)
+{
+  libsurvive_ros2::TrackingHealth h(0.5, 0.25, 0.5);
+  EXPECT_TRUE(std::isinf(h.snapshot(10.0).hit_age_s));
+  h.on_hit(0, 10.0);
+  EXPECT_NEAR(h.snapshot(10.4).hit_age_s, 0.4, 1e-9);
+  EXPECT_TRUE(std::isinf(h.snapshot(10.4).light_age_s)) << "a raw hit is not a solved sweep";
+  h.on_solved_sweep(0, 10.5);
+  EXPECT_NEAR(h.snapshot(11.0).hit_age_s, 1.0, 1e-9) << "solved sweeps do not count as raw hits";
 }

@@ -47,6 +47,8 @@ Per tracker (`libsurvive/tracker/<serial>`; level OK = light-tracked, WARN = IMU
 | `lighthouses_visible` | base stations with a solved sweep in the last 500 ms |
 | `pose_source` | `light`, `imu_only` (poses flow but nothing optical for `imu_only_after_s`, default 0.25 s) or `none` (no pose for `pose_stale_after_s`, default 0.5 s) |
 | `light_relocks` | times the driver re-sent the lightcap mode switch to this device (self-heal, below) |
+| `hit_age_s` | seconds since the last *raw* lightcap hit from any base station (`inf` if never); drives the wedge restart |
+| `calibration_frozen` | `true` once the calibration is read-only for this process (record mode, or after `freeze_calibration`) |
 | `lh_hits_500ms`, `lh_solved_500ms` | per base station `LHB-xxxx=n` raw sweep hits / solved sweeps in the last 500 ms |
 
 Per base station (`libsurvive/lighthouse/<serial>`): the calibration flags and variance as before, plus
@@ -66,7 +68,9 @@ fresh process sends at startup. Set the parameter `<= 0` to disable. `light_relo
 firmware acknowledges it (`LightcapMode 2 -> 2`) but the lightcap interface stays silent while the IMU
 interface streams on, indefinitely. The only cure ever observed is a fresh device open, and libsurvive has no
 working internal reopen path. So when a tracker has been IMU-only for `wedge_restart_after_s` (**off by default**; the kinisi `umi.launch.py` sets 20 s together with `respawn=True`)
-after at least `wedge_restart_min_relocks` (default 2) relocks, the node logs FATAL and exits with status 75;
+after at least `wedge_restart_min_relocks` (default 2) relocks, the node logs FATAL and exits with status 75.
+"IMU-only" here means raw lightcap silence (`hit_age_s`), counted from process start if no light ever arrived —
+the wedge has been seen to strike on a fresh device open (12 sweeps, then silence) and the next open cured it;
 launch it with `respawn=True` (the kinisi `umi.launch.py` does) and it is back within a few seconds. A tracker
 that is genuinely covered for longer than that restarts on the same schedule until light returns — harmless,
 but expect it. Set `wedge_restart_after_s <= 0` to disable. `--record <path>` in `driver_args` is rewritten to

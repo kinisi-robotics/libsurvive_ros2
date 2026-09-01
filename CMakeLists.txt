@@ -61,6 +61,7 @@ externalproject_add(libsurvive
 # Find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(std_srvs REQUIRED)
 find_package(rclcpp_components REQUIRED)
 find_package(diagnostic_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
@@ -91,6 +92,7 @@ ament_target_dependencies(libsurvive_ros2_component
   diagnostic_msgs
   geometry_msgs
   sensor_msgs
+  std_srvs
   tf2
   tf2_ros)
 rclcpp_components_register_nodes(libsurvive_ros2_component "libsurvive_ros2::Component")

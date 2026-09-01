@@ -1,0 +1,70 @@
+From f67a48493fcfd510bf0d1a04d078e72c3c6ab469 Mon Sep 17 00:00:00 2001
+From: Paris Thomas <paris@kinisi.com>
+Date: Fri, 28 Aug 2026 12:26:55 +0000
+Subject: [PATCH] =?UTF-8?q?kinisi:=20survive=5Fcalibration=5Ffreeze()=20?=
+ =?UTF-8?q?=E2=80=94=20persist=20and=20lock=20the=20calibration=20at=20run?=
+ =?UTF-8?q?time?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Lets a session start with --force-calibrate (solve the room from scratch,
+because base stations on tripods get moved between sessions), and once a
+monitor judges the solve converged, lock it in place without restarting the
+context: config_save() once, then set disable-calibrate so the existing
+frozen-calibration guards apply from here on. Keeps the world frame.
+---
+ include/libsurvive/survive.h |  8 ++++++++
+ src/survive.c                | 17 +++++++++++++++++
+ 2 files changed, 25 insertions(+)
+
+diff --git a/include/libsurvive/survive.h b/include/libsurvive/survive.h
+index b5d7af7..02e3e8c 100644
+--- a/include/libsurvive/survive.h
++++ b/include/libsurvive/survive.h
+@@ -715,6 +715,14 @@ SURVIVE_EXPORT const SurvivePose *survive_get_lighthouse_position(const SurviveC
+  */
+ SURVIVE_EXPORT bool survive_calibration_frozen(const SurviveContext *ctx);
+ 
++/**
++ * Freeze the calibration now, at runtime: write the current lighthouse calibration to the config file one last
++ * time, then set disable-calibrate so that from here on nothing modifies it in memory or on disk (see
++ * survive_calibration_frozen). Lets a session solve the room from scratch (--force-calibrate) and then lock the
++ * result in without restarting the context, so the world frame is kept. Returns false if already frozen.
++ */
++SURVIVE_EXPORT bool survive_calibration_freeze(SurviveContext *ctx);
++
+ // This is the disambiguator function, for taking light timing and figuring out place-in-sweep for a given photodiode.
+ SURVIVE_EXPORT uint8_t survive_map_sensor_id(SurviveObject *so, uint8_t reported_id);
+ SURVIVE_EXPORT bool handle_lightcap(SurviveObject *so, const LightcapElement *le);
+diff --git a/src/survive.c b/src/survive.c
+index 23e82a1..e5a9651 100644
+--- a/src/survive.c
++++ b/src/survive.c
+@@ -882,6 +882,23 @@ SURVIVE_EXPORT bool survive_calibration_frozen(const SurviveContext *ctx) {
+ 	return survive_configi((SurviveContext *)ctx, "disable-calibrate", SC_GET, 0) != 0;
+ }
+ 
++SURVIVE_EXPORT bool survive_calibration_freeze(SurviveContext *ctx) {
++	if (survive_calibration_frozen(ctx)) {
++		return false;
++	}
++	int solved = 0;
++	for (int i = 0; i < ctx->activeLighthouses; i++) {
++		solved += ctx->bsd[i].PositionSet && ctx->bsd[i].OOTXSet;
++	}
++	// Persist first: config_save() becomes a no-op the moment the flag is set.
++	config_save(ctx);
++	survive_configi(ctx, "disable-calibrate", SC_OVERRIDE | SC_SET, 1);
++	SV_INFO("Calibration frozen at the caller's request with %d/%d lighthouses solved; the config file was written "
++			"once and will not change again for the life of this context",
++			solved, ctx->activeLighthouses);
++	return true;
++}
++
+ void survive_reset_lighthouse_position(SurviveContext *ctx, int bsd_idx) {
+ 	ctx->bsd[bsd_idx].PositionSet = false;
+ 	ctx->bsd[bsd_idx].variance = (SurviveVelocity){0};
+-- 
+2.43.0
+
