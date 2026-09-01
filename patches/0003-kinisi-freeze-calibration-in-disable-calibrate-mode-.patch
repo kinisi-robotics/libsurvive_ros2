@@ -1,0 +1,292 @@
+From f711ee7bd10fd415276a93a04cd3549890df4abe Mon Sep 17 00:00:00 2001
+From: Paris Thomas <paris@kinisi.com>
+Date: Thu, 27 Aug 2026 18:17:42 +0000
+Subject: [PATCH 3/3] kinisi: freeze calibration in disable-calibrate mode,
+ flag OOTX channel conflicts, light-relock self-heal
+
+---
+ include/libsurvive/survive.h | 15 ++++++++
+ src/driver_vive.c            | 69 ++++++++++++++++++++++++++++++++++++
+ src/survive.c                |  4 +++
+ src/survive_config.c         | 11 ++++++
+ src/survive_process.c        | 17 +++++++++
+ src/survive_process_gen2.c   | 17 +++++++++
+ 6 files changed, 133 insertions(+)
+
+diff --git a/include/libsurvive/survive.h b/include/libsurvive/survive.h
+index 6c5ef82..b5d7af7 100644
+--- a/include/libsurvive/survive.h
++++ b/include/libsurvive/survive.h
+@@ -227,6 +227,9 @@ struct SurviveObject {
+ 
+ 		uint32_t extent_hits, extent_misses, naive_hits;
+ 		FLT min_extent, max_extent;
++
++		// Times the driver re-sent the lightcap mode switch because the device went dark (light-relock-timeout).
++		uint32_t light_relocks;
+ 	} stats;
+ 
+ 	LinmathPoint3d acceleration;
+@@ -316,6 +319,12 @@ struct BaseStationData {
+ 	SurvivePose old_pos;
+ 	FLT true_pos_time;
+ 	SurvivePose true_pos;
++
++	// With disable-calibrate set, an OOTX packet carrying a different base station id on this slot's channel
++	// is rejected instead of overwriting the stored calibration; the offending id and a count are kept here
++	// so consumers can flag the conflict.
++	uint32_t ootx_conflict_id;
++	uint32_t ootx_conflict_count;
+ };
+ 
+ struct config_group;
+@@ -700,6 +709,12 @@ SURVIVE_EXPORT void survive_reset_lighthouse_position(SurviveContext *ctx, int b
+ SURVIVE_EXPORT const SurvivePose *survive_get_lighthouse_true_position(const SurviveContext *ctx, int bsd_idx);
+ SURVIVE_EXPORT const SurvivePose *survive_get_lighthouse_position(const SurviveContext *ctx, int bsd_idx);
+ 
++/**
++ * True when disable-calibrate is set: the stored lighthouse calibration (poses and OOTX) is read-only for the
++ * life of the context. Nothing may modify it in memory or on disk.
++ */
++SURVIVE_EXPORT bool survive_calibration_frozen(const SurviveContext *ctx);
++
+ // This is the disambiguator function, for taking light timing and figuring out place-in-sweep for a given photodiode.
+ SURVIVE_EXPORT uint8_t survive_map_sensor_id(SurviveObject *so, uint8_t reported_id);
+ SURVIVE_EXPORT bool handle_lightcap(SurviveObject *so, const LightcapElement *le);
+diff --git a/src/driver_vive.c b/src/driver_vive.c
+index 272820f..9af7da5 100755
+--- a/src/driver_vive.c
++++ b/src/driver_vive.c
+@@ -440,6 +440,11 @@ struct SurviveUSBInfo {
+ 
+ 	size_t timeWithoutFlag;
+ 	size_t packetsSeenWaitingForV2;
++
++	// Run time of the last decoded lightcap (sync or sweep) and of the last re-sent mode switch; drive the
++	// light-relock-timeout self-heal in handle_watchman_v2.
++	FLT last_light_time;
++	FLT last_relock_time;
+ 	size_t ignoreCnt;
+ 
+ 	size_t active_transfers;
+@@ -456,6 +461,8 @@ struct SurviveViveData {
+ 	struct libusb_context *usbctx;
+ 	size_t read_count;
+ 	int seconds_per_hz_output;
++	FLT light_relock_timeout;
++	FLT light_relock_force_interval;
+ 
+ 	int cnt_per_device_type[sizeof(KnownDeviceTypes) / sizeof(KnownDeviceTypes[0])];
+ 	struct SurviveUSBInfo *hmd_mainboard, *hmd_imu;
+@@ -872,11 +879,21 @@ int survive_usb_init(SurviveViveData *sv) {
+ 
+ STATIC_CONFIG_ITEM(PAIR_DEVICE, "pair-device", 'b', "Turn on pairing mode", 0)
+ STATIC_CONFIG_ITEM(SECONDS_PER_HZ_OUTPUT, "usb-hz-output", 'i', "Seconds between outputing usb stats", -1)
++STATIC_CONFIG_ITEM(LIGHT_RELOCK_TIMEOUT, "light-relock-timeout", 'f',
++				   "Seconds a live (IMU-reporting) LH2 device may go without any lightcap data before the lightcap "
++				   "mode switch is re-sent to it, forcing the firmware to re-acquire the base stations. <= 0 disables.",
++				   -1.)
++STATIC_CONFIG_ITEM(LIGHT_RELOCK_FORCE_INTERVAL, "light-relock-force-interval", 'f',
++				   "Test knob: re-send the lightcap mode switch every N seconds regardless of light, to verify a "
++				   "relock does not disturb tracking. <= 0 disables.",
++				   -1.)
+ void survive_vive_usb_close(SurviveViveData *sv) {
+ 	survive_release_ctx_lock(sv->ctx);
+ 	survive_usb_close(sv);
+ 	survive_get_ctx_lock(sv->ctx);
+ 	survive_detach_config(sv->ctx, SECONDS_PER_HZ_OUTPUT_TAG, &sv->seconds_per_hz_output);
++	survive_detach_config(sv->ctx, LIGHT_RELOCK_TIMEOUT_TAG, &sv->light_relock_timeout);
++	survive_detach_config(sv->ctx, LIGHT_RELOCK_FORCE_INTERVAL_TAG, &sv->light_relock_force_interval);
+ }
+ 
+ static inline bool survive_handle_close_request_flag(struct SurviveUSBInfo *usbInfo) {
+@@ -2075,6 +2092,45 @@ static inline void parse_and_process_lightcap(SurviveObject *w, uint16_t time, u
+ 	}
+ }
+ 
++static inline void note_lightcap_seen(SurviveObject *obj) {
++	struct SurviveUSBInfo *driverInfo = obj->driver;
++	if (driverInfo) {
++		driverInfo->last_light_time = survive_run_time(obj->ctx);
++	}
++}
++
++/**
++ * Self-heal for LH2 devices that stop delivering lightcap data after prolonged total darkness even though the
++ * IMU stream (and so this handler) keeps running. The only thing observed to recover such a device is the
++ * lightcap mode switch a fresh process sends at startup, so re-send it once every light-relock-timeout seconds
++ * of darkness. Returns true when a switch was (re)sent; the caller should then skip this packet like the
++ * initial mode switch does.
++ */
++static bool maybe_relock_lightcap(SurviveObject *w, struct SurviveUSBInfo *driverInfo) {
++	SurviveContext *ctx = w->ctx;
++	SurviveViveData *sv = driverInfo->viveData;
++	if (sv == 0 || driverInfo->lightcapMode != LightcapMode_raw1) {
++		return false;
++	}
++	FLT now = survive_run_time(ctx);
++	FLT since_light = now - driverInfo->last_light_time;
++	FLT since_relock = now - driverInfo->last_relock_time;
++	bool dark = sv->light_relock_timeout > 0 && since_light > sv->light_relock_timeout &&
++				since_relock > sv->light_relock_timeout;
++	bool forced = sv->light_relock_force_interval > 0 && since_relock > sv->light_relock_force_interval;
++	if (!dark && !forced) {
++		return false;
++	}
++	w->stats.light_relocks++;
++	SV_WARN("%s: %s for %.1fs; re-sending lightcap mode switch (relock #%u)", w->codename,
++			forced && !dark ? "forced relock test" : "no lightcap data", since_light, w->stats.light_relocks);
++	driverInfo->last_relock_time = now;
++	driverInfo->last_light_time = now;
++	driverInfo->timeWithoutFlag = 0;
++	vive_switch_mode(driverInfo, LightcapMode_raw1);
++	return true;
++}
++
+ static int parse_and_process_raw1_lightcap(SurviveObject *obj, uint16_t time, uint8_t *packet, uint8_t length) {
+ 	bool has_errors = false;
+ 	uint8_t idx = 0;
+@@ -2138,6 +2194,7 @@ static int parse_and_process_raw1_lightcap(SurviveObject *obj, uint16_t time, ui
+ 					dump_binary = true;
+ 					// has_errors = true;
+ 				} else {
++					note_lightcap_seen(obj);
+ 					SURVIVE_INVOKE_HOOK_SO(sync, obj, channel, timecode, ootx, g);
+ 				}
+ 			} else {
+@@ -2157,6 +2214,7 @@ static int parse_and_process_raw1_lightcap(SurviveObject *obj, uint16_t time, ui
+ 					dump_binary = true;
+ 					// has_errors = true;
+ 				} else {
++					note_lightcap_seen(obj);
+ 					SURVIVE_INVOKE_HOOK_SO(sweep, obj, channel, survive_map_sensor_id(obj, sensor), timecode,
+ 										   half_clock_flag);
+ 				}
+@@ -2306,6 +2364,10 @@ static void handle_watchman_v2(SurviveObject *w, uint64_t time_in_us, uint16_t t
+ 
+ 	if (w->ctx->lh_version == 1 && driverInfo->lightcapMode != LightcapMode_raw1) {
+ 		vive_switch_mode(driverInfo, LightcapMode_raw1);
++		driverInfo->last_light_time = driverInfo->last_relock_time = survive_run_time(ctx);
++		return;
++	}
++	if (w->ctx->lh_version == 1 && maybe_relock_lightcap(w, driverInfo)) {
+ 		return;
+ 	}
+ 
+@@ -2979,6 +3041,11 @@ void survive_data_cb_locked(uint64_t time_received_us, SurviveUSBInterface *si)
+ 														  time_received_us);
+ 			}
+ 		}
++		// A wired LH2 device delivers lightcap on its own interface, which goes completely silent in
++		// darkness; this IMU stream is the heartbeat that lets the light-relock timer run.
++		if (obj->ctx->lh_version == 1 && obj->driver) {
++			maybe_relock_lightcap(obj, obj->driver);
++		}
+ 		// DONE OK.
+ 		break;
+ 	}
+@@ -3279,6 +3346,8 @@ int DriverRegHTCVive(SurviveContext *ctx) {
+ 	SurviveViveData *sv = SV_CALLOC(sizeof(SurviveViveData));
+ 
+ 	survive_attach_configi(ctx, SECONDS_PER_HZ_OUTPUT_TAG, &sv->seconds_per_hz_output);
++	survive_attach_configf(ctx, LIGHT_RELOCK_TIMEOUT_TAG, &sv->light_relock_timeout);
++	survive_attach_configf(ctx, LIGHT_RELOCK_FORCE_INTERVAL_TAG, &sv->light_relock_force_interval);
+ 	sv->requestPairing = survive_configi(ctx, PAIR_DEVICE_TAG, SC_GET, 0);
+ 
+ 	if(sv->seconds_per_hz_output > 0) {
+diff --git a/src/survive.c b/src/survive.c
+index 76e2afa..23e82a1 100644
+--- a/src/survive.c
++++ b/src/survive.c
+@@ -878,6 +878,10 @@ const void *survive_get_driver_by_closefn(const SurviveContext *ctx, DeviceDrive
+ 	return 0;
+ }
+ 
++SURVIVE_EXPORT bool survive_calibration_frozen(const SurviveContext *ctx) {
++	return survive_configi((SurviveContext *)ctx, "disable-calibrate", SC_GET, 0) != 0;
++}
++
+ void survive_reset_lighthouse_position(SurviveContext *ctx, int bsd_idx) {
+ 	ctx->bsd[bsd_idx].PositionSet = false;
+ 	ctx->bsd[bsd_idx].variance = (SurviveVelocity){0};
+diff --git a/src/survive_config.c b/src/survive_config.c
+index 8a228c9..15cdd2f 100644
+--- a/src/survive_config.c
++++ b/src/survive_config.c
+@@ -760,6 +760,17 @@ const char *survive_config_file_path(struct SurviveContext *ctx, char *path) {
+ // struct SurviveContext
+ SurviveContext *survive_context;
+ void config_save(SurviveContext *ctx) {
++	// A frozen calibration is never written back: the file is the operator's blessed record of the room and a
++	// recording session must not be able to alter it (nor truncate it on a full disk).
++	if (survive_calibration_frozen(ctx)) {
++		static bool warnedOnce = false;
++		if (!warnedOnce) {
++			SV_INFO("disable-calibrate is set; the config file will not be written");
++			warnedOnce = true;
++		}
++		return;
++	}
++
+ 	char path[FILENAME_MAX] = "";
+ 	survive_config_file_path(ctx, path);
+ 
+diff --git a/src/survive_process.c b/src/survive_process.c
+index 1d1bf10..29d2c71 100644
+--- a/src/survive_process.c
++++ b/src/survive_process.c
+@@ -188,6 +188,23 @@ void survive_default_ootx_received_process(struct SurviveContext *ctx, uint8_t b
+ void survive_default_raw_lighthouse_pose_process(SurviveContext *ctx, uint8_t lighthouse,
+ 											 const SurvivePose *lighthouse_pose) {
+ 	bool notSet = ctx->bsd[lighthouse].PositionSet == 0;
++
++	// Frozen calibration: a stored pose is immutable. Re-announcing the identical stored pose (startup) is
++	// allowed so downstream consumers still learn it; any refinement from the lighthouse filter or a poser is
++	// dropped, and clearing the position is refused.
++	if (survive_calibration_frozen(ctx) && !notSet) {
++		bool identical = lighthouse_pose &&
++						 memcmp(lighthouse_pose, &ctx->bsd[lighthouse].Pose, sizeof(SurvivePose)) == 0;
++		if (!identical) {
++			static uint32_t dropped = 0;
++			if ((dropped++ % 1000) == 0) {
++				SV_VERBOSE(10, "Ignoring lighthouse %d pose update; calibration is frozen (disable-calibrate), %u dropped",
++						   lighthouse, dropped);
++			}
++			return;
++		}
++	}
++
+ 	if (lighthouse_pose) {
+ 		for (int i = 0; i < 3; i++)
+ 			assert(isfinite(lighthouse_pose->Pos[i]));
+diff --git a/src/survive_process_gen2.c b/src/survive_process_gen2.c
+index aa2c9da..cdac1a6 100644
+--- a/src/survive_process_gen2.c
++++ b/src/survive_process_gen2.c
+@@ -50,6 +50,23 @@ static void ootx_packet_clbk_d_gen2(ootx_decoder_context *ct, ootx_packet *packe
+ 	FLT accel[3] = {v15.accel_dir[0], v15.accel_dir[1], v15.accel_dir[2]};
+ 	bool upChanged = norm3d(b->accel) != 0.0 && dist3d(b->accel, accel) > 1e-3;
+ 
++	if (survive_calibration_frozen(ctx) && b->OOTXSet) {
++		if (b->BaseStationID != v15.id) {
++			// Another base station is transmitting on this slot's channel. The calibration is frozen, so keep
++			// the stored OOTX/pose and only record the conflict; tracking on this channel is unreliable until
++			// the foreign station is moved off it.
++			b->ootx_conflict_count++;
++			if (b->ootx_conflict_id != v15.id || (b->ootx_conflict_count % 100) == 1) {
++				SV_WARN("ERROR: base station %08x seen on channel %d, which is calibrated for %08x; calibration is "
++						"frozen (disable-calibrate) so it is NOT updated. Power off or re-channel the foreign station "
++						"(conflict #%u).",
++						(unsigned)v15.id, ctx->bsd[id].mode, (unsigned)b->BaseStationID, b->ootx_conflict_count);
++			}
++			b->ootx_conflict_id = v15.id;
++		}
++		return;
++	}
++
+ 	if (upChanged) {
+ 		SV_VERBOSE(10, "OOTX up direction changed for %x (%f)", b->BaseStationID, norm3d(b->accel));
+ 	}
+-- 
+2.43.0
+

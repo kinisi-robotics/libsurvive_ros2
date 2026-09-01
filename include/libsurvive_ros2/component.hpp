@@ -27,6 +27,7 @@
 #include <os_generic.h>
 
 // C++ system
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <map>
@@ -44,6 +45,7 @@
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "libsurvive/survive_api.h"
 #include "libsurvive/survive.h"
+#include "libsurvive_ros2/tracking_health.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/imu.hpp"
 #include "sensor_msgs/msg/joy.hpp"
@@ -63,6 +65,12 @@ public:
   // Record the latest smoothed optical residual for a tracker serial. Called
   // from the libsurvive datalog callback (libsurvive worker thread).
   void record_light_residual(const std::string & serial, double value);
+  // Light-pipeline events for a tracker, from libsurvive's hooks (its threads):
+  // a raw sweep decoded from lighthouse `lh`, a sweep solved into an angle, and
+  // a batch of light integrated into the pose filter.
+  void record_sweep_hit(const std::string & serial, int lh);
+  void record_solved_sweep(const std::string & serial, int lh);
+  void record_light_integrated(const std::string & serial);
 
 private:
   void work();
@@ -77,6 +85,10 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_publisher_;
   rclcpp::Publisher<diagnostic_msgs::msg::KeyValue>::SharedPtr cfg_publisher_;
   rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diagnostics_publisher_;
+  // The tracker rows of the diagnostics array, one message per tracker, so a
+  // consumer that gates on tracking quality (e.g. a data recorder) can subscribe
+  // to a single small topic instead of filtering the array.
+  rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticStatus>::SharedPtr tracking_status_publisher_;
   std::thread worker_thread_;
   rclcpp::Time last_base_station_update_;
   std::string tracking_frame_;
@@ -91,6 +103,29 @@ private:
   // ROS time each tracker's pose was last broadcast, for pose-freshness in
   // diagnostics. Written and read only on the worker thread, so no lock needed.
   std::map<std::string, rclcpp::Time> last_pose_time_;
+
+  // Optical-tracking health per tracker serial, fed from libsurvive's sweep /
+  // sweep-angle / datalog hooks and the pose events, read by publish_diagnostics().
+  // Guarded because producers and consumer run on different threads.
+  static double mono_now();
+  TrackingHealth & health_for(const std::string & serial);
+  std::mutex health_mutex_;
+  std::map<std::string, TrackingHealth> health_;
+  double imu_only_after_s_ = 0.25;
+  double pose_stale_after_s_ = 0.5;
+  // libsurvive's light-relock self-heal (see patches/), forwarded as driver args.
+  double light_relock_timeout_s_ = 3.0;
+  double light_relock_force_interval_s_ = -1.0;
+
+  // Wedge self-heal of last resort: a tracker that streams IMU but no light for
+  // this long, although the driver has already re-sent the lightcap mode switch
+  // at least wedge_restart_min_relocks_ times, is treated as wedged at the
+  // USB/firmware layer (the only known cure is a fresh device open) and the
+  // process exits so the launch file can respawn it. <= 0 disables.
+  double wedge_restart_after_s_ = 0.0;  // opt-in: the launch file that sets respawn enables it
+  int wedge_restart_min_relocks_ = 2;
+  bool wedge_exit_requested_ = false;
+  void maybe_exit_for_wedge(const std::string & serial, double light_age_s, int relocks);
 
   bool publish_diagnostics_ = true;
   bool capture_light_residual_ = true;

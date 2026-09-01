@@ -19,15 +19,19 @@
 // THE SOFTWARE.
 
 // C++ system
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <format>  // NOLINT(build/include_order): cpplint predates C++20 <format>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
+#include <cstdlib>
+#include <ctime>
 
 // Other
 #include "libsurvive_ros2/component.hpp"
@@ -62,10 +66,12 @@ static void imu_func(
 }
 
 // libsurvive emits many internal time series through the datalog hook; we keep
-// only the smoothed optical residual ("res_error_light_avg", i.e. the tracker's
-// light_residuals_all), which is the value libsurvive itself thresholds against
-// light-error-threshold to decide tracking is lost. The name check rejects every
-// other series cheaply. Runs on the libsurvive worker thread.
+// two: the smoothed optical residual ("res_error_light_avg", i.e. the tracker's
+// light_residuals_all, which libsurvive itself thresholds against
+// light-error-threshold to decide tracking is lost) and the per-batch residual
+// ("res_error_light_"), whose arrival is the only signal that light was actually
+// folded into the pose filter. The name checks reject every other series
+// cheaply. Runs on the libsurvive worker thread.
 static void datalog_func(
   SurviveObject * so, const char * name, const FLT * values, size_t length)
 {
@@ -74,10 +80,41 @@ static void datalog_func(
   {
     return;
   }
-  if (std::strcmp(name, "res_error_light_avg") != 0) {
-    return;
+  if (std::strcmp(name, "res_error_light_avg") == 0) {
+    _singleton->record_light_residual(so->serial_number, values[0]);
+  } else if (std::strcmp(name, "res_error_light_") == 0) {
+    _singleton->record_light_integrated(so->serial_number);
   }
-  _singleton->record_light_residual(so->serial_number, values[0]);
+}
+
+// Light hooks: chain to libsurvive's own processing after noting the event.
+// A sweep is a raw pulse attributed to a lighthouse channel; a sweep angle is
+// that pulse turned into a usable measurement. Both run on libsurvive's threads.
+static sweep_process_func _prev_sweep_fn = nullptr;
+static sweep_angle_process_func _prev_sweep_angle_fn = nullptr;
+
+static void sweep_func(
+  SurviveObject * so, survive_channel channel, int sensor_id, survive_timecode timecode,
+  bool flag)
+{
+  if (_singleton && so) {
+    _singleton->record_sweep_hit(so->serial_number, survive_get_bsd_idx(so->ctx, channel));
+  }
+  if (_prev_sweep_fn) {
+    _prev_sweep_fn(so, channel, sensor_id, timecode, flag);
+  }
+}
+
+static void sweep_angle_func(
+  SurviveObject * so, survive_channel channel, int sensor_id, survive_timecode timecode,
+  int8_t plane, FLT angle)
+{
+  if (_singleton && so) {
+    _singleton->record_solved_sweep(so->serial_number, survive_get_bsd_idx(so->ctx, channel));
+  }
+  if (_prev_sweep_angle_fn) {
+    _prev_sweep_angle_fn(so, channel, sensor_id, timecode, plane, angle);
+  }
 }
 
 static void ros_from_pose(
@@ -142,11 +179,54 @@ Component::Component(const rclcpp::NodeOptions & options)
   this->get_parameter("diagnostics_topic", diagnostics_topic);
   diagnostics_publisher_ =
     this->create_publisher<diagnostic_msgs::msg::DiagnosticArray>(diagnostics_topic, 10);
+  std::string tracking_status_topic;
+  this->declare_parameter("tracking_status_topic", "tracking_status");
+  this->get_parameter("tracking_status_topic", tracking_status_topic);
+  tracking_status_publisher_ =
+    this->create_publisher<diagnostic_msgs::msg::DiagnosticStatus>(tracking_status_topic, 10);
+
+  // Tracking-health thresholds behind pose_source (see TrackingHealth).
+  this->declare_parameter("imu_only_after_s", imu_only_after_s_);
+  this->get_parameter("imu_only_after_s", imu_only_after_s_);
+  this->declare_parameter("pose_stale_after_s", pose_stale_after_s_);
+  this->get_parameter("pose_stale_after_s", pose_stale_after_s_);
+
+  // Self-heal for a tracker that keeps streaming IMU but delivers no light after
+  // total occlusion: libsurvive (our patched build) re-sends the lightcap mode
+  // switch after this many seconds of darkness. <= 0 disables. The force
+  // interval is a test knob that relocks periodically regardless of light.
+  this->declare_parameter("light_relock_timeout_s", light_relock_timeout_s_);
+  this->get_parameter("light_relock_timeout_s", light_relock_timeout_s_);
+  this->declare_parameter("light_relock_force_interval_s", light_relock_force_interval_s_);
+  this->get_parameter("light_relock_force_interval_s", light_relock_force_interval_s_);
+  this->declare_parameter("wedge_restart_after_s", wedge_restart_after_s_);
+  this->get_parameter("wedge_restart_after_s", wedge_restart_after_s_);
+  this->declare_parameter("wedge_restart_min_relocks", wedge_restart_min_relocks_);
+  this->get_parameter("wedge_restart_min_relocks", wedge_restart_min_relocks_);
 
   // Setup driver parameters.
   std::string driver_args;
   this->declare_parameter("driver_args", "--force-calibrate 1");
   this->get_parameter("driver_args", driver_args);
+  // Parameters win over nothing: an explicit flag in driver_args is left alone.
+  if (driver_args.find("--light-relock-timeout") == std::string::npos) {
+    driver_args += std::format(" --light-relock-timeout {}", light_relock_timeout_s_);
+  }
+  if (light_relock_force_interval_s_ > 0.0 &&
+    driver_args.find("--light-relock-force-interval") == std::string::npos)
+  {
+    driver_args +=
+      std::format(" --light-relock-force-interval {}", light_relock_force_interval_s_);
+  }
+  // A respawned process would truncate the previous run's --record file — the
+  // one artefact that explains why it respawned — so stamp the path per start.
+  {
+    const auto t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    char stamp[32];
+    std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", std::localtime(&t));
+    driver_args = stamp_record_path(driver_args, stamp);
+  }
+  RCLCPP_INFO(this->get_logger(), "libsurvive driver args: %s", driver_args.c_str());
   // libsurvive's parser treats argv[0] as the program name and scans from
   // argv[1], so prepend a placeholder or the first flag is dropped.
   std::vector<std::string> tokens{"libsurvive_ros2_node"};
@@ -183,6 +263,8 @@ Component::Component(const rclcpp::NodeOptions & options)
   if (capture_light_residual_) {
     survive_install_datalog_fn(ctx, datalog_func);
   }
+  _prev_sweep_fn = survive_install_sweep_fn(ctx, sweep_func);
+  _prev_sweep_angle_fn = survive_install_sweep_angle_fn(ctx, sweep_angle_func);
 
   // Initialize the survive thread.
   survive_simple_start_thread(actx_);
@@ -216,6 +298,41 @@ void Component::record_light_residual(const std::string & serial, double value)
   light_residuals_[serial] = value;
 }
 
+double Component::mono_now()
+{
+  return std::chrono::duration<double>(
+    std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// Caller holds health_mutex_.
+TrackingHealth & Component::health_for(const std::string & serial)
+{
+  auto found = health_.find(serial);
+  if (found == health_.end()) {
+    found = health_.emplace(
+      serial, TrackingHealth(0.5, imu_only_after_s_, pose_stale_after_s_)).first;
+  }
+  return found->second;
+}
+
+void Component::record_sweep_hit(const std::string & serial, int lh)
+{
+  std::lock_guard<std::mutex> lock(health_mutex_);
+  health_for(serial).on_hit(lh, mono_now());
+}
+
+void Component::record_solved_sweep(const std::string & serial, int lh)
+{
+  std::lock_guard<std::mutex> lock(health_mutex_);
+  health_for(serial).on_solved_sweep(lh, mono_now());
+}
+
+void Component::record_light_integrated(const std::string & serial)
+{
+  std::lock_guard<std::mutex> lock(health_mutex_);
+  health_for(serial).on_light_integrated(mono_now());
+}
+
 void Component::publish_imu(const sensor_msgs::msg::Imu & msg)
 {
   if (imu_publisher_) {
@@ -243,11 +360,68 @@ std::string num(double value)
 }
 }  // namespace
 
+void Component::maybe_exit_for_wedge(const std::string & serial, double light_age_s, int relocks)
+{
+  if (wedge_exit_requested_ ||
+    !wedge_restart_due(light_age_s, relocks, wedge_restart_after_s_, wedge_restart_min_relocks_))
+  {
+    return;
+  }
+  wedge_exit_requested_ = true;
+  RCLCPP_FATAL(
+    this->get_logger(),
+    "%s: IMU streaming but no light for %.1f s despite %d lightcap relocks — the "
+    "tracker's light path is wedged (USB/firmware); exiting so the launch file "
+    "respawns a fresh device open. Cover the tracker for a real occlusion test and "
+    "this is expected; otherwise capture --record for offline replay.",
+    serial.c_str(), light_age_s, relocks);
+  // Flush every stdio stream (ROS console output, libsurvive's --record file)
+  // and leave immediately: tearing rclcpp/libsurvive down from the worker
+  // thread is not worth the risk, the point is a clean re-enumeration.
+  std::fflush(nullptr);
+  std::_Exit(kWedgeExitCode);
+}
+
 void Component::publish_diagnostics()
 {
   diagnostic_msgs::msg::DiagnosticArray array;
   array.header.stamp = this->now();
   array.header.frame_id = tracking_frame_;
+
+  SurviveContext * ctx = survive_simple_get_ctx(actx_);
+
+  // Snapshot every tracker's light health once, under the lock, then build the
+  // message lock-free. Lighthouse rows sum the per-tracker counts.
+  std::map<std::string, TrackingHealth::Snapshot> health;
+  {
+    std::lock_guard<std::mutex> lock(health_mutex_);
+    const double now = mono_now();
+    for (auto & [serial, h] : health_) {
+      health[serial] = h.snapshot(now);
+    }
+  }
+  std::array<int, TrackingHealth::kMaxLighthouses> lh_hits{};
+  std::array<int, TrackingHealth::kMaxLighthouses> lh_solved{};
+  for (const auto & [serial, snap] : health) {
+    for (std::size_t lh = 0; lh < TrackingHealth::kMaxLighthouses; ++lh) {
+      lh_hits[lh] += snap.hits[lh];
+      lh_solved[lh] += snap.solved[lh];
+    }
+  }
+
+  // Lighthouse slot index -> serial, for the per-lighthouse breakdown on tracker rows.
+  std::map<int, std::string> lh_serials;
+  for (const SurviveSimpleObject * it = survive_simple_get_first_object(actx_); it != nullptr;
+    it = survive_simple_get_next_object(actx_, it))
+  {
+    if (survive_simple_object_get_type(it) == SurviveSimpleObject_LIGHTHOUSE) {
+      const BaseStationData * bsd = survive_simple_get_bsd(it);
+      const char * serial_c = survive_simple_serial_number(it);
+      if (bsd != nullptr && serial_c != nullptr) {
+        lh_serials[static_cast<int>(bsd - ctx->bsd)] = serial_c;
+      }
+    }
+  }
 
   for (const SurviveSimpleObject * it = survive_simple_get_first_object(actx_); it != nullptr;
     it = survive_simple_get_next_object(actx_, it))
@@ -270,11 +444,26 @@ void Component::publish_diagnostics()
         status.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
         status.message = "no base station data";
       } else {
+        const int idx = static_cast<int>(bsd - ctx->bsd);
         const bool calibrated = bsd->PositionSet && bsd->OOTXSet;
+        const bool in_window =
+          idx >= 0 && static_cast<std::size_t>(idx) < TrackingHealth::kMaxLighthouses;
+        const int hits = in_window ? lh_hits[idx] : 0;
+        const int solved = in_window ? lh_solved[idx] : 0;
         status.level = calibrated ?
           diagnostic_msgs::msg::DiagnosticStatus::OK :
           diagnostic_msgs::msg::DiagnosticStatus::WARN;
         status.message = calibrated ? "calibrated" : "calibrating";
+        if (bsd->ootx_conflict_count > 0) {
+          // A foreign base station shares this channel (see patches/): the stored
+          // calibration was protected, but every sweep on the channel is now
+          // ambiguous, so tracking through this lighthouse is unreliable.
+          status.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
+          status.message = std::format(
+            "channel {} conflict: foreign base station LHB-{:08X} seen {} times; "
+            "stored calibration kept (record mode)",
+            static_cast<int>(bsd->mode), bsd->ootx_conflict_id, bsd->ootx_conflict_count);
+        }
         add_kv(status, "position_set", bsd->PositionSet ? "true" : "false");
         add_kv(status, "ootx_set", bsd->OOTXSet ? "true" : "false");
         add_kv(status, "ootx_checked", bsd->OOTXChecked ? "true" : "false");
@@ -290,6 +479,13 @@ void Component::publish_diagnostics()
           status, "variance",
           num(var[0]) + " " + num(var[1]) + " " + num(var[2]) + " " +
           num(var[3]) + " " + num(var[4]) + " " + num(var[5]));
+        add_kv(status, "hits_500ms", std::to_string(hits));
+        add_kv(status, "solved_sweeps_500ms", std::to_string(solved));
+        add_kv(status, "visible", solved > 0 ? "true" : "false");
+        add_kv(
+          status, "ootx_conflict_id",
+          bsd->ootx_conflict_count > 0 ? std::format("LHB-{:08X}", bsd->ootx_conflict_id) : "");
+        add_kv(status, "ootx_conflict_count", std::to_string(bsd->ootx_conflict_count));
       }
     } else {
       SurviveObject * so = survive_simple_get_survive_object(it);
@@ -297,8 +493,6 @@ void Component::publish_diagnostics()
         continue;  // external / unknown object — nothing to report
       }
       status.name = "libsurvive/tracker/" + serial;
-      status.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
-      status.message = "tracking";
 
       // Age since this tracker's pose was last broadcast, in ROS time (set in
       // the work loop on each PoseUpdateEvent). Infinity until the first pose.
@@ -320,11 +514,50 @@ void Component::publish_diagnostics()
         }
       }
 
+      TrackingHealth::Snapshot snap;
+      const auto hs = health.find(serial);
+      if (hs != health.end()) {
+        snap = hs->second;
+      }
+      if (snap.pose_source == "light") {
+        status.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
+        status.message = "tracking";
+      } else if (snap.pose_source == "imu_only") {
+        status.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+        status.message = std::format(
+          "no light for {:.1f} s: pose is IMU dead-reckoning", snap.light_integrated_age_s);
+      } else {
+        status.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
+        status.message = std::format("no pose for {:.1f} s", pose_age_s);
+      }
+
+      // Existing keys first, unchanged: downstream monitors parse them by name.
       add_kv(status, "pose_confidence", num(so->poseConfidence));
       add_kv(status, "light_residual", num(residual));
       add_kv(status, "pose_age_s", num(pose_age_s));
       add_kv(status, "charging", so->charging ? "true" : "false");
       add_kv(status, "charge_percent", std::to_string(static_cast<int>(so->charge)));
+
+      add_kv(status, "light_age_s", num(snap.light_age_s));
+      add_kv(status, "light_integrated_age_s", num(snap.light_integrated_age_s));
+      add_kv(status, "lighthouses_visible", std::to_string(snap.lighthouses_visible));
+      add_kv(status, "pose_source", snap.pose_source);
+      add_kv(status, "light_relocks", std::to_string(so->stats.light_relocks));
+      add_kv(status, "wedge_restart_after_s", num(wedge_restart_after_s_));
+      maybe_exit_for_wedge(serial, snap.light_age_s, static_cast<int>(so->stats.light_relocks));
+      std::string hits_s;
+      std::string solved_s;
+      for (const auto & [idx, lh_serial] : lh_serials) {
+        if (idx < 0 || static_cast<std::size_t>(idx) >= TrackingHealth::kMaxLighthouses) {
+          continue;
+        }
+        hits_s += std::format("{}{}={}", hits_s.empty() ? "" : " ", lh_serial, snap.hits[idx]);
+        solved_s +=
+          std::format("{}{}={}", solved_s.empty() ? "" : " ", lh_serial, snap.solved[idx]);
+      }
+      add_kv(status, "lh_hits_500ms", hits_s);
+      add_kv(status, "lh_solved_500ms", solved_s);
+      tracking_status_publisher_->publish(status);
     }
 
     array.status.push_back(status);
@@ -365,6 +598,10 @@ void Component::work()
               // libsurvive's internal clock bases. Read by publish_diagnostics
               // (same worker thread, so no lock needed).
               last_pose_time_[pose_msg.child_frame_id] = this->now();
+              {
+                std::lock_guard<std::mutex> lock(health_mutex_);
+                health_for(pose_msg.child_frame_id).on_pose(mono_now());
+              }
             }
           }
           break;
