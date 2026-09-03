@@ -1,0 +1,112 @@
+From e2dbcf298c0620d2cdb50b843043f95170770ee3 Mon Sep 17 00:00:00 2001
+From: Paris Thomas <paris@kinisi.com>
+Date: Thu, 3 Sep 2026 14:25:22 +0000
+Subject: [PATCH] kinisi: sparse lighthouse config slots must not stall the
+ posers
+
+config_save() writes only slots with OOTXSet and config_read_lighthouse()
+matches a group to its own index, so a slot that never decoded OOTX leaves
+a hole in the file (lighthouse0,1,3,4,5 with no lighthouse2). Loading such
+a file counted the entries (5) into ctx->activeLighthouses, but every
+consumer uses that value as an index bound: slot 5 fell outside the bound
+and its sweeps were dropped in survive_process_gen2, while slot 2 stayed a
+zeroed struct (mode 0xFF, OOTXSet 0) inside the bound. poser_mpfit and the
+global scene solver refuse to solve anything until every slot below the
+bound has OOTX, so the hole stalled the calibration forever, and the simple
+API published the hole as a phantom "LHB-0" lighthouse.
+
+* survive.c: set activeLighthouses = i + 1 for every slot read, the way
+  survive_get_bsd_idx already maintains it at runtime; warn about holes.
+* poser_mpfit.c, driver_global_scene_solver.c: skip unpopulated slots in
+  the OOTX wait loops instead of breaking out of the solve.
+* survive_api.c: do not create a simple-API object for an unpopulated slot
+  at startup; lh_fn creates it once a station fills the slot.
+
+config_save() is left as is so the on-disk format of dense files does not
+change; a hole is now harmless.
+---
+ src/driver_global_scene_solver.c |  2 ++
+ src/poser_mpfit.c                |  5 +++++
+ src/survive.c                    | 14 +++++++++++++-
+ src/survive_api.c                |  4 ++++
+ 4 files changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/src/driver_global_scene_solver.c b/src/driver_global_scene_solver.c
+index 646df56..9ee75c7 100644
+--- a/src/driver_global_scene_solver.c
++++ b/src/driver_global_scene_solver.c
+@@ -197,6 +197,8 @@ static void set_needs_solve(global_scene_solver *gss) {
+ 	FLT now = survive_run_time(gss->ctx);
+ 
+ 	for (int lh = 0; lh < gss->ctx->activeLighthouses; lh++) {
++		if (gss->ctx->bsd[lh].mode == 0xFF)
++			continue; // unpopulated slot (hole in a sparse config file); nothing to wait for
+ 		if (!gss->ctx->bsd[lh].OOTXSet)
+ 			return;
+ 	}
+diff --git a/src/poser_mpfit.c b/src/poser_mpfit.c
+index 4ce6e01..ce04063 100644
+--- a/src/poser_mpfit.c
++++ b/src/poser_mpfit.c
+@@ -364,6 +364,11 @@ static int setup_optimizer(struct async_optimizer_user *user, survive_optimizer
+ 
+ 	if (bestObjForCal || (d->syncs_seen > syncs_required && objectStationary)) {
+ 		for (int lh = 0; lh < so->ctx->activeLighthouses; lh++) {
++			if (so->ctx->bsd[lh].mode == 0xFF) {
++				// Unpopulated slot (a hole in a sparse config file, see survive.c); there is no station to wait
++				// for, so it must not hold up the solve of the ones that are.
++				continue;
++			}
+ 			if (!so->ctx->bsd[lh].OOTXSet) {
+ 				// Wait til this thing gets OOTX, and then solve for as much as we can. Avoids doing
+ 				// two solves in a row because of OOTX timing.
+diff --git a/src/survive.c b/src/survive.c
+index e5a9651..b1225c8 100644
+--- a/src/survive.c
++++ b/src/survive.c
+@@ -506,7 +506,12 @@ SurviveContext *survive_init_internal(int argc, char *const *argv, void *userDat
+ 		if (config_read_lighthouse(ctx->lh_config, &(ctx->bsd[i]), i)) {
+ 			if (ctx->bsd[i].mode >= 0 && ctx->bsd[i].mode < 16)
+ 				ctx->bsd_map[ctx->bsd[i].mode] = i;
+-			ctx->activeLighthouses++;
++			// activeLighthouses is consumed everywhere as an index bound (`for lh < activeLighthouses`), and the
++			// runtime mapper (survive_get_bsd_idx) maintains it as one. A config file can be sparse -- config_save()
++			// only writes slots with OOTXSet, so a slot that never decoded OOTX leaves a hole -- and counting the
++			// entries instead of tracking the highest slot made every station above the hole invisible while the
++			// hole itself (mode 0xFF, no OOTX) stalled the posers forever.
++			ctx->activeLighthouses = i + 1;
+ 			SV_VERBOSE(50, "Adding LH %d mode: %d id: %08x", i, ctx->bsd[i].mode, (unsigned)ctx->bsd[i].BaseStationID);
+ 		}
+ 		char buffer[128] = {0};
+@@ -518,6 +523,13 @@ SurviveContext *survive_init_internal(int argc, char *const *argv, void *userDat
+ 		ctx->bsd[i].tracker = SV_MALLOC(sizeof(struct SurviveKalmanLighthouse));
+ 		survive_kalman_lighthouse_init(ctx->bsd[i].tracker, ctx, i);
+ 	};
++	for (int i = 0; i < ctx->activeLighthouses; i++) {
++		if (ctx->bsd[i].mode == 0xFF) {
++			SV_WARN("Config has no lighthouse%d but has slots above it; the slot is left free for the next new "
++					"base station and is ignored until then",
++					i);
++		}
++	}
+ 
+ 	if( list_for_autocomplete )
+ 	{
+diff --git a/src/survive_api.c b/src/survive_api.c
+index dcfb6e2..36b48ec 100644
+--- a/src/survive_api.c
++++ b/src/survive_api.c
+@@ -308,6 +308,10 @@ SURVIVE_EXPORT SurviveSimpleContext *survive_simple_init_with_logger(int argc, c
+ 
+ 	intptr_t i = 0;
+ 	for (i = 0; i < ctx->activeLighthouses; i++) {
++		// An unpopulated slot (hole in a sparse config file) has no station yet: creating it here would pin the
++		// serial "LHB-0" on it for the life of the context. lh_fn creates the object when a station fills it.
++		if (ctx->bsd[i].mode == 0xFF)
++			continue;
+ 		create_lighthouse(actx, i);
+ 	}
+ 
+-- 
+2.43.0
+
